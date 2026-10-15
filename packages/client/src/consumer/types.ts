@@ -460,6 +460,22 @@ export interface ConsumerEvents {
 	partitionsLost: [partitions: TopicPartition[]]
 	/** Emitted when fetching advances; offset is the next fetch position after this range. */
 	fetchPosition: [position: TopicPartitionOffset, recordCount: number]
+	/**
+	 * Emitted when the broker no longer holds a partition's fetch position (OFFSET_OUT_OF_RANGE,
+	 * usually because retention deleted it) and `autoOffsetReset` moved the position. When
+	 * `toOffset` is greater than `fromOffset`, the records between them are never delivered.
+	 */
+	offsetReset: [reset: OffsetReset]
+}
+
+export interface OffsetReset {
+	topic: string
+	partition: number
+	/** The offset the consumer was about to fetch. */
+	fromOffset: bigint
+	/** The offset fetching resumes from. */
+	toOffset: bigint
+	strategy: 'earliest' | 'latest'
 }
 
 export interface InternalConsumerContext {

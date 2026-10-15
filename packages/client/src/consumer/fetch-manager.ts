@@ -19,7 +19,14 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
-import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
+import type {
+	TopicPartition,
+	TopicPartitionOffset,
+	AutoOffsetReset,
+	IsolationLevel,
+	OffsetReset,
+	PartitionBatch,
+} from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
@@ -526,6 +533,8 @@ export interface FetchManagerConfig {
 	maxBufferedBytes?: number
 	/** Called whenever a decoded batch range advances the fetch position. */
 	onFetchPosition?: (position: TopicPartitionOffset, recordCount: number) => void
+	/** Called after an OFFSET_OUT_OF_RANGE error moves a partition's fetch position. */
+	onOffsetReset?: (reset: OffsetReset) => void
 	priority?: PriorityStrategy
 }
 
@@ -858,12 +867,28 @@ export class FetchManager {
 					// its position with the reset.
 					{
 						const epochBeforeReset = state.fetchEpoch
+						const fromOffset = state.offset
+						const strategy = this.autoOffsetReset
 						const resetOffset =
-							this.autoOffsetReset === 'earliest'
+							strategy === 'earliest'
 								? await this.offsetManager.getEarliestOffset(state.topic, state.partition)
 								: await this.offsetManager.getLatestOffset(state.topic, state.partition)
 						if (state.fetchEpoch === epochBeforeReset) {
 							state.offset = resetOffset
+							this.logger.warn('fetch offset out of range, reset partition position', {
+								topic: state.topic,
+								partition: state.partition,
+								fromOffset: String(fromOffset),
+								toOffset: String(resetOffset),
+								strategy,
+							})
+							this.config.onOffsetReset?.({
+								topic: state.topic,
+								partition: state.partition,
+								fromOffset,
+								toOffset: resetOffset,
+								strategy,
+							})
 						}
 					}
 				}

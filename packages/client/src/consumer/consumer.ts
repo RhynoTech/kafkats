@@ -228,6 +228,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				onFetchPosition: (position, recordCount) => {
 					this.emit('fetchPosition', position, recordCount)
 				},
+				onOffsetReset: reset => {
+					this.emit('offsetReset', reset)
+				},
 			},
 			logger
 		)

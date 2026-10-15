@@ -244,6 +244,12 @@ consumer.on('partitionsLost', partitions => {
 	console.log('Lost partitions:', partitions)
 	// Cannot commit offsets for these partitions
 })
+
+// The broker no longer holds the fetch position (usually retention deleted it), so
+// autoOffsetReset moved it. Records between fromOffset and toOffset are never delivered.
+consumer.on('offsetReset', ({ topic, partition, fromOffset, toOffset, strategy }) => {
+	console.warn(`Reset ${topic}-${partition} from ${fromOffset} to ${toOffset} (${strategy})`)
+})
 ```
 
 ## Error Handling Patterns

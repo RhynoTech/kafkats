@@ -197,4 +197,126 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		await inflight
 		expect(state.offset).toBe(200n)
 	})
+
+	it('reports the reset and the offsets it skipped', async () => {
+		const broker = {
+			nodeId: 1,
+			fetch: vi.fn().mockResolvedValue({
+				topics: [
+					{
+						topic: 't',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.OffsetOutOfRange, recordsData: null }],
+					},
+				],
+			}),
+		}
+		const cluster = {
+			getLeaderForPartition: vi.fn().mockResolvedValue(broker),
+			getLogger: () => null,
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const offsetManager = new OffsetManager(cluster as any, 'g1')
+		vi.spyOn(offsetManager, 'getLatestOffset').mockResolvedValue(500n)
+		const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), child: () => logger }
+		const onOffsetReset = vi.fn()
+
+		const fm = new FetchManager(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cluster as any,
+			offsetManager,
+			'latest',
+			{
+				maxBytesPerPartition: 1024,
+				minBytes: 1,
+				maxWaitMs: 50,
+				partitionConcurrency: 1,
+				isolationLevel: 'read_uncommitted',
+				onOffsetReset,
+			},
+			logger
+		)
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const fmAny = fm as any
+		fmAny.fetchBuffer = { add: vi.fn(), removePartitions: vi.fn(), isFull: () => false }
+
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 100n }])
+		await fmAny.fetchFromBrokerToBuffer(broker, [fmAny.partitionStates.get('t:0')], 1048576)
+
+		expect(onOffsetReset).toHaveBeenCalledOnce()
+		expect(onOffsetReset).toHaveBeenCalledWith({
+			topic: 't',
+			partition: 0,
+			fromOffset: 100n,
+			toOffset: 500n,
+			strategy: 'latest',
+		})
+		expect(logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining('out of range'),
+			expect.objectContaining({
+				topic: 't',
+				partition: 0,
+				fromOffset: '100',
+				toOffset: '500',
+				strategy: 'latest',
+			})
+		)
+	})
+
+	it('does not report a reset that a concurrent seek replaced', async () => {
+		const broker = {
+			nodeId: 1,
+			fetch: vi.fn().mockResolvedValue({
+				topics: [
+					{
+						topic: 't',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.OffsetOutOfRange, recordsData: null }],
+					},
+				],
+			}),
+		}
+		const cluster = {
+			getLeaderForPartition: vi.fn().mockResolvedValue(broker),
+			getLogger: () => null,
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const offsetManager = new OffsetManager(cluster as any, 'g1')
+		let resolveOffset: (o: bigint) => void = () => {}
+		vi.spyOn(offsetManager, 'getEarliestOffset').mockImplementation(
+			() =>
+				new Promise<bigint>(resolve => {
+					resolveOffset = resolve
+				})
+		)
+		const onOffsetReset = vi.fn()
+
+		const fm = new FetchManager(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cluster as any,
+			offsetManager,
+			'earliest',
+			{
+				maxBytesPerPartition: 1024,
+				minBytes: 1,
+				maxWaitMs: 50,
+				partitionConcurrency: 1,
+				isolationLevel: 'read_uncommitted',
+				onOffsetReset,
+			}
+		)
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const fmAny = fm as any
+		fmAny.fetchBuffer = { add: vi.fn(), removePartitions: vi.fn(), isFull: () => false }
+
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 100n }])
+		const state = fmAny.partitionStates.get('t:0')
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
+		await new Promise(resolve => setTimeout(resolve, 0))
+
+		fm.seekPartition('t', 0, 300n)
+		resolveOffset(200n)
+		await inflight
+
+		expect(state.offset).toBe(300n)
+		expect(onOffsetReset).not.toHaveBeenCalled()
+	})
 })

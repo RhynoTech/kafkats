@@ -46,6 +46,7 @@ export type {
 	RunBatchOptions,
 	StreamOptions,
 	TopicOf,
+	OffsetReset,
 	PriorityStrategy,
 	SchedulerState,
 	SchedulerPartition,

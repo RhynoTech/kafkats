@@ -39,6 +39,7 @@ export type {
 	ConsumerGroupState,
 	ConsumerGroupEvents,
 	ConsumerEvents,
+	OffsetReset,
 } from './types.js'
 
 export { strict, weighted } from './priority.js'
