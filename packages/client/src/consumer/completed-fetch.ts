@@ -23,6 +23,8 @@ const LENGTH_PREFIX_BYTES = 12
 const HEADER_BYTES = 61
 /** The CRC covers the batch from its attributes to its end. */
 const CRC_START = 21
+/** Estimated in-memory cost of a decoded record beyond its key and value. */
+const RECORD_OVERHEAD_BYTES = 64
 
 interface AbortedRange {
 	start: bigint
@@ -146,7 +148,12 @@ function endOffset(headers: BatchHeader[]): bigint | null {
 
 /** Estimated in-memory size of a decoded record; drives the per-partition batch cap and the poll budget. */
 export function recordBytes(record: DecodedRecord): number {
-	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
+	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + RECORD_OVERHEAD_BYTES
+}
+
+/** Decompressed over compressed size of the last batch decompressed for a partition; null before one is. */
+export interface CompressionRatio {
+	value: number | null
 }
 
 /**
@@ -175,12 +182,17 @@ export class CompletedFetch {
 	private failure: { error: unknown } | null = null
 	/** A batch found corrupt when fetched, raised once every record before it is consumed. */
 	readonly corruption: Corruption | null
+	/** Totals over the batches not yet opened, kept so deliverableBytes needs no pass over them. */
+	private unopenedPlainBytes = 0
+	private unopenedCompressedBytes = 0
+	private unopenedRecords = 0
 
 	constructor(
 		readonly topic: string,
 		readonly partition: number,
 		readonly assignmentEpoch: number,
-		records: FetchedRecords
+		records: FetchedRecords,
+		private readonly ratio: CompressionRatio = { value: null }
 	) {
 		this.data = records.data
 		this.batches = records.batches
@@ -189,6 +201,7 @@ export class CompletedFetch {
 		this.position = records.fetchOffset
 		this.consumedPosition = records.fetchOffset
 		this.corruption = records.corruption
+		for (const batch of this.batches) this.countUnopened(batch, 1)
 	}
 
 	/**
@@ -197,6 +210,20 @@ export class CompletedFetch {
 	 */
 	get heldBytes(): number {
 		return this.data.length + (this.reader?.decompressedBytes ?? 0) + this.decodedBytes
+	}
+
+	/**
+	 * Estimated decoded size of the records not yet consumed, in recordBytes() units: exact for those
+	 * already decoded, and from their bytes for the rest, compressed batches scaled by the
+	 * partition's compression ratio.
+	 */
+	get deliverableBytes(): number {
+		if (this.undecoded === 0) return this.decodedBytes
+		const unopened =
+			this.unopenedPlainBytes +
+			this.unopenedCompressedBytes * (this.ratio.value ?? 1) +
+			RECORD_OVERHEAD_BYTES * this.unopenedRecords
+		return Math.round(this.decodedBytes + (this.reader?.undecodedBytes ?? 0) + unopened)
 	}
 
 	get isEmpty(): boolean {
@@ -256,6 +283,7 @@ export class CompletedFetch {
 				if (reader === null) {
 					const batch = this.batches[this.nextBatch++]
 					if (batch === undefined) break
+					this.countUnopened(batch, -1)
 					const opened = openBatch(this.data, batch)
 					if (opened instanceof Promise) return this.open(opened)
 					this.reader = opened
@@ -283,11 +311,20 @@ export class CompletedFetch {
 		return false
 	}
 
+	private countUnopened(batch: FetchedBatch, sign: 1 | -1): void {
+		const payloadBytes = sign * (batch.end - batch.start - HEADER_BYTES)
+		if (getCompressionType(batch.attributes) === CompressionType.None) this.unopenedPlainBytes += payloadBytes
+		else this.unopenedCompressedBytes += payloadBytes
+		this.unopenedRecords += sign * batch.recordCount
+	}
+
 	private open(opened: Promise<BatchReader>): Promise<void> {
 		this.opening = opened
 			.then(
 				reader => {
 					this.reader = reader
+					const compressedBytes = reader.batch.end - reader.batch.start - HEADER_BYTES
+					if (compressedBytes > 0) this.ratio.value = reader.decompressedBytes / compressedBytes
 				},
 				(error: unknown) => {
 					this.failure = { error }
@@ -328,6 +365,11 @@ class BatchReader {
 		}
 		this.left = batch.recordCount
 		this.offset = batch.baseOffset
+	}
+
+	/** The records not yet read, estimated as recordBytes() counts them. */
+	get undecodedBytes(): number {
+		return this.decoder.remaining() + RECORD_OVERHEAD_BYTES * this.left
 	}
 
 	next(): DecodedRecord | null {

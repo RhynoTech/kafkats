@@ -17,7 +17,10 @@ The fetch buffer now counts the bytes it actually holds: fetched batches at thei
 decoded, decompressed batch per partition, and the records decoded ahead at their estimated size. The default bound
 stays 10 × `maxBytesPerPartition`, and is no longer exceeded by responses that decode larger than they were fetched.
 Priority strategies see `bufferedBytes` and `bufferCapacityBytes` in the same fetched bytes; `byteBudget` and `maxBytes`
-still count decoded records.
+still count decoded records, and a new per-partition `deliverableBytes` estimates the buffered records in those units,
+scaling batches not yet decompressed by the partition's last seen compression ratio. The built-in `strict` and
+`weighted` strategies use it for poll shares and tier gating. With a strategy set, the first record a partition
+fetches is decoded on arrival to learn that ratio.
 
 Corrupt record data found by the client (CRC mismatch, bad framing, a batch that fails to decompress) is now raised
 like a broker `CORRUPT_MESSAGE`: the records before the bad batch are delivered first, the error names the bad batch's

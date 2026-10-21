@@ -1,8 +1,16 @@
 export interface SchedulerPartition {
 	topic: string
 	partition: number
-	/** Fetched bytes held but not yet delivered, compressed batches at their compressed size. */
+	/**
+	 * Fetched bytes held but not yet delivered, compressed batches at their compressed size: the
+	 * units of `bufferCapacityBytes` and `bufferedBytes` of the state.
+	 */
 	bufferedBytes: number
+	/**
+	 * Estimated decoded size of the buffered records not yet delivered: the units of `byteBudget` and
+	 * `maxBytes`. Batches not yet decompressed are scaled by the partition's last seen compression ratio.
+	 */
+	deliverableBytes: number
 	busy: boolean
 }
 
@@ -66,23 +74,23 @@ export function strict<const T extends string>(options: { order: readonly T[] })
 				.sort((a, b) => a.rank - b.rank || a.index - b.index)
 
 			const drain = ranked
-				.filter(({ partition }) => !partition.busy && partition.bufferedBytes > 0)
+				.filter(({ partition }) => !partition.busy && partition.deliverableBytes > 0)
 				.map(({ partition }) => ({
 					topic: partition.topic,
 					partition: partition.partition,
 					maxBytes: state.byteBudget,
 				}))
 
-			const bufferedByRank = Array<number>(fallbackRank + 1).fill(0)
+			const deliverableByRank = Array<number>(fallbackRank + 1).fill(0)
 			for (const { partition, rank } of ranked) {
-				if (!partition.busy) bufferedByRank[rank]! += partition.bufferedBytes
+				if (!partition.busy) deliverableByRank[rank]! += partition.deliverableBytes
 			}
 
 			let allowedRank = 0
-			let higherBuffered = bufferedByRank[0]!
-			while (allowedRank < fallbackRank && higherBuffered < state.byteBudget) {
+			let higherDeliverable = deliverableByRank[0]!
+			while (allowedRank < fallbackRank && higherDeliverable < state.byteBudget) {
 				allowedRank++
-				higherBuffered += bufferedByRank[allowedRank]!
+				higherDeliverable += deliverableByRank[allowedRank]!
 			}
 
 			const fetch = ranked
@@ -117,7 +125,7 @@ export function weighted<const T extends string>(options: {
 				partitions,
 				share: shareOf(topic),
 				demand: partitions.reduce(
-					(total, partition) => total + (partition.busy ? 0 : partition.bufferedBytes),
+					(total, partition) => total + (partition.busy ? 0 : partition.deliverableBytes),
 					0
 				),
 				allocation: 0,
@@ -148,7 +156,7 @@ export function weighted<const T extends string>(options: {
 				let allocation = topic.allocation
 				for (const partition of topic.partitions) {
 					if (partition.busy || allocation === 0) continue
-					const maxBytes = Math.min(allocation, partition.bufferedBytes)
+					const maxBytes = Math.min(allocation, partition.deliverableBytes)
 					if (maxBytes > 0) drain.push({ topic: topic.topic, partition: partition.partition, maxBytes })
 					allocation -= maxBytes
 				}

@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { weighted } from '@/consumer/priority.js'
 import type { SchedulerPartition, SchedulerState } from '@/consumer/priority.js'
 
-function partition(topic: string, bufferedBytes: number): SchedulerPartition {
-	return { topic, partition: 0, bufferedBytes, busy: false }
+function partition(topic: string, bufferedBytes: number, deliverableBytes = bufferedBytes): SchedulerPartition {
+	return { topic, partition: 0, bufferedBytes, deliverableBytes, busy: false }
 }
 
 function state(partitions: SchedulerPartition[], byteBudget = 100): SchedulerState {
@@ -33,6 +33,18 @@ describe('weighted topic priority', () => {
 			['other', 25],
 		])
 		expect(decision.fetch).toEqual([{ topic: 'other', partition: 0 }])
+	})
+
+	it('allocates the poll budget by deliverable bytes and gates fetching by fetched bytes', () => {
+		// live holds 10 compressed bytes that decode to 1000; bulk is uncompressed.
+		const decision = weighted({ shares: { live: 3, bulk: 1 } }).schedule(
+			state([partition('live', 10, 1000), partition('bulk', 100)])
+		)
+		expect(decision.drain.map(p => [p.topic, p.maxBytes])).toEqual([
+			['live', 75],
+			['bulk', 25],
+		])
+		expect(decision.fetch.map(p => p.topic)).toEqual(['live', 'bulk'])
 	})
 
 	it('validates shares', () => {

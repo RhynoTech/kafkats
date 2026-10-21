@@ -18,7 +18,7 @@ import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
-import { CompletedFetch, readFetchedRecords, recordBytes } from './completed-fetch.js'
+import { CompletedFetch, readFetchedRecords, recordBytes, type CompressionRatio } from './completed-fetch.js'
 
 function corruptDataError(topic: string, partition: number, offset: bigint, cause: unknown): Error {
 	const message = cause instanceof Error ? cause.message : String(cause)
@@ -38,6 +38,7 @@ interface BufferedPartitionStats {
 	topic: string
 	partition: number
 	bytes: number
+	deliverableBytes: number
 }
 
 /** Anything with set-like `has(topic:partition)`; a Set or a Map keyed by partition works. */
@@ -258,9 +259,15 @@ class FetchBuffer {
 		const stats = new Map<string, BufferedPartitionStats>()
 		for (const fetch of this.queue) {
 			const key = tpKey(fetch.topic, fetch.partition)
-			const existing = stats.get(key)
-			if (existing) existing.bytes += fetch.heldBytes
-			else stats.set(key, { topic: fetch.topic, partition: fetch.partition, bytes: fetch.heldBytes })
+			const stat = stats.get(key) ?? {
+				topic: fetch.topic,
+				partition: fetch.partition,
+				bytes: 0,
+				deliverableBytes: 0,
+			}
+			stat.bytes += fetch.heldBytes
+			stat.deliverableBytes += fetch.deliverableBytes
+			stats.set(key, stat)
 		}
 		return Array.from(stats.values())
 	}
@@ -527,6 +534,7 @@ export class FetchManager {
 	// `active` map, so the background fetch loop sees current busy state when it schedules fetches.
 	private lastExcluded?: PartitionKeys
 	private stageScheduled = false
+	private readonly compressionRatios = new Map<string, CompressionRatio>()
 
 	constructor(
 		cluster: Cluster,
@@ -1092,6 +1100,10 @@ export class FetchManager {
 
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
 					const fetchOffset = state.offset
+					const stale = () =>
+						state.abortController.signal.aborted ||
+						state.paused ||
+						state.fetchEpoch !== issuedEpochByKey.get(key)
 					const read = readFetchedRecords(partitionResponse.recordsData, {
 						fetchOffset,
 						abortedTransactions: partitionResponse.abortedTransactions,
@@ -1102,19 +1114,26 @@ export class FetchManager {
 					const fetched = read instanceof Promise ? await read : read
 
 					// Reading may have awaited a decode; re-fence (revoked, paused, or seeked meanwhile).
-					if (
-						state.abortController.signal.aborted ||
-						state.paused ||
-						state.fetchEpoch !== issuedEpochByKey.get(key)
-					)
-						continue
+					if (stale()) continue
 
 					// A corrupt batch is buffered behind the records before it, so a drain delivers them and
 					// then raises it like a broker CORRUPT_MESSAGE. Re-fetching returns the same bytes, so the
 					// partition is not fetched again until then.
 					if (fetched.recordCount > 0 || fetched.corruption) {
 						const assignmentEpoch = this.getAssignmentEpoch(state.topic, state.partition)
-						this.fetchBuffer.add(new CompletedFetch(state.topic, state.partition, assignmentEpoch, fetched))
+						const ratio = this.compressionRatio(key)
+						const fetch = new CompletedFetch(state.topic, state.partition, assignmentEpoch, fetched, ratio)
+						if (this.config.priority && ratio.value === null) {
+							// Strategies weigh deliverableBytes against decoded budgets, which for compressed batches
+							// takes this partition's compression ratio; decoding its first record learns it.
+							try {
+								await fetch.peek()
+							} catch {
+								// Kept by the fetch for the drain that reaches it to raise.
+							}
+							if (stale()) continue
+						}
+						this.fetchBuffer.add(fetch)
 					}
 
 					// Advance the fetch position past the whole fetched batch range, even when no
@@ -1255,6 +1274,12 @@ export class FetchManager {
 		this.pendingError = corruptDataError(topic, partition, fetch.failedAt(error), error)
 	}
 
+	private compressionRatio(key: string): CompressionRatio {
+		const ratio = this.compressionRatios.get(key) ?? { value: null }
+		this.compressionRatios.set(key, ratio)
+		return ratio
+	}
+
 	/** Buffered partitions first (in buffer order), then idle assigned partitions with zero buffered. */
 	private buildSchedulerState(fetchBuffer: FetchBuffer, excludedPartitions?: PartitionKeys): SchedulerState {
 		const buffered = new Map(fetchBuffer.snapshot().map(stat => [tpKey(stat.topic, stat.partition), stat]))
@@ -1265,6 +1290,7 @@ export class FetchManager {
 				topic: state.topic,
 				partition: state.partition,
 				bufferedBytes: stat?.bytes ?? 0,
+				deliverableBytes: stat?.deliverableBytes ?? 0,
 				busy: excludedPartitions?.has(key) ?? false,
 			}
 		}

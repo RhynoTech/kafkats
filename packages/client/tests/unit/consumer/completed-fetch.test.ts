@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { CompletedFetch, readFetchedRecords } from '@/consumer/completed-fetch.js'
-import type { FetchedRecords, ReadFetchedRecordsOptions } from '@/consumer/completed-fetch.js'
+import { CompletedFetch, readFetchedRecords, recordBytes } from '@/consumer/completed-fetch.js'
+import type { CompressionRatio, FetchedRecords, ReadFetchedRecordsOptions } from '@/consumer/completed-fetch.js'
 import { compressionCodecs } from '@/protocol/records/codec-registry.js'
 import { CompressionType, getCompressionTypeName, gzipCodec } from '@/protocol/records/compression.js'
 import { createRecordBatch, decodeRecordBatch, encodeRecordBatch } from '@/protocol/records/index.js'
@@ -285,6 +285,32 @@ describe('CompletedFetch', () => {
 		expect(() => fetch.peek()).toThrow(/CRC mismatch/)
 		expect(fetch.failedAt(fetch.corruption!.error)).toBe(4n)
 		expect(fetch.failedAt(new Error('decode'))).toBe(2n)
+	})
+
+	it('estimates records not yet decoded from their bytes, scaling compressed ones by the partition ratio', async () => {
+		const value = Buffer.alloc(1000, 0x61)
+		const gzipBatch = (first: bigint) =>
+			encodeRecordBatch(createRecordBatch([{ value }, { value }, { value }], first, 0n), {
+				compression: CompressionType.Gzip,
+			})
+		const data = Buffer.concat([await gzipBatch(0n), await gzipBatch(3n)])
+		const decoded = (await drainAll(new CompletedFetch('t', 0, 0, await read(data)))).reduce(
+			(sum, record) => sum + recordBytes(record),
+			0
+		)
+
+		const ratio: CompressionRatio = { value: null }
+		const first = new CompletedFetch('t', 0, 0, await read(data), ratio)
+		expect(first.deliverableBytes).toBeLessThan(decoded / 2)
+		await first.peek()
+		expect(ratio.value).toBeGreaterThan(10)
+		expect(Math.abs(first.deliverableBytes - decoded) / decoded).toBeLessThan(0.05)
+
+		// The partition's next fetch is estimated from the ratio before any of its batches is opened.
+		const next = new CompletedFetch('t', 0, 0, await read(data), ratio)
+		expect(Math.abs(next.deliverableBytes - decoded) / decoded).toBeLessThan(0.05)
+		await drainAll(next)
+		expect(next.deliverableBytes).toBe(0)
 	})
 
 	it('throws from a drain, not from the read, when a compressed batch fails to decompress', async () => {

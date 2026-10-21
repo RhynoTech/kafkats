@@ -221,11 +221,13 @@ weighted shares receive a share of `1`.
 
 Custom strategies implement `PriorityStrategy` and return ordered `drain` entries, each capped at `maxBytes` out of
 the poll's `byteBudget` (the consumer's `maxBytesPerPartition`), plus the partitions currently allowed to `fetch`.
-`maxBytes` and `byteBudget` count the estimated decoded size of delivered records, while `bufferedBytes` and
-`bufferCapacityBytes` count fetched bytes, compressed batches at their compressed size. Buffered partitions omitted
-from `drain` are still delivered FIFO after the planned entries within the remaining poll budget, so hold a topic
-back through `fetch`, not `drain`. Derive fairness from the supplied scheduler state: the fetch loop may call
-`schedule()` without a drain, and a drain decision may be only partially applied.
+`maxBytes` and `byteBudget` count the estimated decoded size of delivered records, and so does each partition's
+`deliverableBytes`, which scales batches not yet decompressed by the compression ratio last seen on that partition.
+`bufferedBytes` and `bufferCapacityBytes` count fetched bytes, compressed batches at their compressed size, so compare
+`deliverableBytes` with the budget and `bufferedBytes` with the capacity. Buffered partitions omitted from `drain` are
+still delivered FIFO after the planned entries within the remaining poll budget, so hold a topic back through
+`fetch`, not `drain`. Derive fairness from the supplied scheduler state: the fetch loop may call `schedule()` without
+a drain, and a drain decision may be only partially applied.
 
 Priority applies at poll granularity. A handler batch already admitted is never preempted; lower `maxBytesPerPartition` for
 finer-grained scheduling when `partitionConcurrency` is small. Literal topic names are checked against the

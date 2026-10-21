@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
+import { recordBytes } from '@/consumer/completed-fetch.js'
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 import { strict, weighted, type PriorityStrategy } from '@/consumer/priority.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { CompressionType } from '@/protocol/records/compression.js'
+import { createRecordBatch, encodeRecordBatch } from '@/protocol/records/index.js'
 import { completedFetch } from './helpers/completed-fetch.js'
 
 function makeFetchManager(
@@ -100,5 +104,91 @@ describe('FetchManager priority buffer', () => {
 		expect(offsets(drained)).toEqual([0n, 10n, 11n, 12n, 13n])
 		expect(offsets(await manager.poll())).toEqual([1n, 14n])
 		manager.stop()
+	})
+})
+
+describe('FetchManager priority with compressed data', () => {
+	const budget = 64 * 1024
+
+	function manager(priority: PriorityStrategy): FetchManager {
+		const cluster = { getLeaderForPartition: vi.fn(), getLogger: () => null }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const offsetManager = new OffsetManager(cluster as any, 'g')
+		const fm = new FetchManager(cluster as never, offsetManager, 'earliest', {
+			maxBytesPerPartition: budget,
+			minBytes: 1,
+			maxWaitMs: 1,
+			partitionConcurrency: 1,
+			isolationLevel: 'read_uncommitted',
+			maxBufferedBytes: 64 * 1024 * 1024,
+			priority,
+		})
+		fm.addPartitions([
+			{ topic: 'live', partition: 0, offset: 0n },
+			{ topic: 'bulk', partition: 0, offset: 0n },
+		])
+		return fm
+	}
+
+	function batchOf(first: number, count: number, valueBytes: number, compression: CompressionType) {
+		const value = Buffer.alloc(valueBytes, 0x61)
+		const records = Array.from({ length: count }, () => ({ value, timestamp: 0 }))
+		return encodeRecordBatch(createRecordBatch(records, BigInt(first), 0n), { compression })
+	}
+
+	/** About 210 KiB of records that gzip to a few KiB. */
+	async function liveData(): Promise<Buffer> {
+		const batches: Buffer[] = []
+		for (let first = 0; first < 200; first += 50) batches.push(await batchOf(first, 50, 1000, CompressionType.Gzip))
+		return Buffer.concat(batches)
+	}
+
+	async function deliver(fm: FetchManager, topic: string, recordsData: Buffer): Promise<void> {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const internal = fm as any
+		const partition = {
+			partitionIndex: 0,
+			errorCode: ErrorCode.None,
+			highWatermark: 1_000_000n,
+			lastStableOffset: 1_000_000n,
+			logStartOffset: 0n,
+			abortedTransactions: [],
+			preferredReadReplica: -1,
+			recordsData,
+		}
+		const fetch = vi.fn().mockResolvedValue({ topics: [{ topic, partitions: [partition] }], throttleTimeMs: 0 })
+		await internal.fetchFromBrokerToBuffer(
+			{ nodeId: 1, fetch },
+			[internal.partitionStates.get(`${topic}:0`)],
+			1 << 30
+		)
+	}
+
+	it('splits a weighted poll by decoded size, not by the compressed size buffered', async () => {
+		const fm = manager(weighted({ shares: { live: 3, bulk: 1 } }))
+		await fm.poll()
+		await deliver(fm, 'live', await liveData())
+		await deliver(fm, 'bulk', await batchOf(0, 100, 600, CompressionType.None))
+
+		const taken = { live: 0, bulk: 0 }
+		for (const batch of await fm.poll()) {
+			for (const record of batch.records) taken[batch.topic as keyof typeof taken] += recordBytes(record)
+		}
+		expect(taken.live / (taken.live + taken.bulk)).toBeCloseTo(0.75, 1)
+		fm.stop()
+	})
+
+	it('withholds a lower strict tier as soon as a compressed higher tier holds a poll of records', async () => {
+		const strategy = strict({ order: ['live', 'bulk'] })
+		const fm = manager(strategy)
+		await fm.poll()
+		await deliver(fm, 'live', await liveData())
+
+		// Before any record is decoded ahead for a poll, which would count them at their decoded size.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const internal = fm as any
+		const decision = strategy.schedule(internal.buildSchedulerState(internal.fetchBuffer))
+		expect(decision.fetch.map(tp => tp.topic)).toEqual(['live'])
+		fm.stop()
 	})
 })
