@@ -5,7 +5,8 @@ import { OffsetManager } from '@/consumer/offset-manager.js'
 import type { IsolationLevel, TopicPartition } from '@/consumer/types.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { FetchRequest } from '@/protocol/messages/requests/fetch.js'
-import { createRecordBatch, encodeRecordBatchSync } from '@/protocol/records/index.js'
+import { CompressionType } from '@/protocol/records/compression.js'
+import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/protocol/records/index.js'
 
 function makeFetchManager(isolationLevel: IsolationLevel = 'read_uncommitted') {
 	const broker = { nodeId: 1, fetch: vi.fn() }
@@ -30,7 +31,12 @@ function makeFetchManager(isolationLevel: IsolationLevel = 'read_uncommitted') {
 	)
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const fmAny = fm as any
-	fmAny.fetchBuffer = { add: vi.fn(), isFull: () => false }
+	fmAny.fetchBuffer = {
+		add: vi.fn(),
+		isFull: () => false,
+		removePartitions: vi.fn(),
+		removePartitionsReturningEarliest: vi.fn(() => new Map()),
+	}
 	return { broker, fm, fmAny }
 }
 
@@ -97,6 +103,23 @@ describe('FetchManager fetch order', () => {
 		])
 	})
 
+	it('moves a partition behind the others after decoding compressed records', async () => {
+		const { broker, fm, fmAny } = makeFetchManager()
+		fm.addPartitions([
+			{ topic: 'a', partition: 0, offset: 0n },
+			{ topic: 'b', partition: 0, offset: 0n },
+		])
+		const recordsData = await encodeRecordBatch(createRecordBatch([{ value: 'v' }], 0n, 0n), {
+			compression: CompressionType.Gzip,
+		})
+
+		broker.fetch.mockResolvedValueOnce(fetchResponse([{ topic: 'a', partition: 0, recordsData }]))
+		await fmAny.fetchFromBrokerToBuffer(broker, [...fmAny.partitionStates.values()], 1048576)
+
+		expect(fmAny.fetchBuffer.add).toHaveBeenCalledOnce()
+		expect([...fmAny.partitionStates.keys()]).toEqual(['b:0', 'a:0'])
+	})
+
 	// The broker's fetch session rotates on response bytes, not on what the client keeps, so a long
 	// aborted run must not hold the front of every request.
 	it.each([
@@ -142,4 +165,44 @@ describe('FetchManager fetch order', () => {
 			expect([...fmAny.partitionStates.keys()]).toEqual(['a:1', 'a:0'])
 		}
 	)
+
+	it.each([
+		{ change: 'seek', apply: (fm: FetchManager) => fm.seekPartition('a', 0, 5n), order: ['a:0', 'b:0'] },
+		{
+			change: 'pause',
+			apply: (fm: FetchManager) => fm.pausePartitions([{ topic: 'a', partition: 0 }]),
+			order: ['a:0', 'b:0'],
+		},
+		{
+			change: 'revoke',
+			apply: (fm: FetchManager) => fm.removePartitions([{ topic: 'a', partition: 0 }]),
+			order: ['b:0'],
+		},
+		{
+			change: 'revoke and re-add',
+			apply: (fm: FetchManager) => {
+				fm.removePartitions([{ topic: 'a', partition: 0 }])
+				fm.addPartitions([{ topic: 'a', partition: 0, offset: 0n }])
+			},
+			order: ['b:0', 'a:0'],
+		},
+	])('leaves the order alone when a $change lands while the fetch is in flight', async ({ apply, order }) => {
+		const { broker, fm, fmAny } = makeFetchManager()
+		fm.addPartitions([
+			{ topic: 'a', partition: 0, offset: 0n },
+			{ topic: 'b', partition: 0, offset: 0n },
+		])
+		let resolveFetch!: (response: unknown) => void
+		broker.fetch.mockReturnValueOnce(new Promise(resolve => (resolveFetch = resolve)))
+
+		const inflight = fmAny.fetchFromBrokerToBuffer(broker, [...fmAny.partitionStates.values()], 1048576)
+		apply(fm)
+		const current = fmAny.partitionStates.get('a:0')
+		resolveFetch(fetchResponse([{ topic: 'a', partition: 0 }]))
+		await inflight
+
+		expect(fmAny.fetchBuffer.add).not.toHaveBeenCalled()
+		expect([...fmAny.partitionStates.keys()]).toEqual(order)
+		expect(fmAny.partitionStates.get('a:0')).toBe(current)
+	})
 })
