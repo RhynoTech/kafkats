@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createRequire } from 'node:module'
+import { gzipSync, gunzipSync } from 'node:zlib'
 
 import {
 	CompressionType,
@@ -8,6 +9,7 @@ import {
 	createSnappyCodec,
 	createZstdCodec,
 	getCompressionTypeName,
+	gzipCodec,
 	type SnappyNativeLib,
 } from '@/protocol/records/compression.js'
 import {
@@ -186,6 +188,9 @@ describe('snappy Xerial framing', () => {
 	})
 })
 
+const json = (bytes: number) =>
+	Buffer.from('{"id":"8f1c","name":"Jane","city":"Detroit"},'.repeat(bytes / 45 + 1)).subarray(0, bytes)
+
 describe('snappy small-block fast path', () => {
 	type SyncSnappy = SnappyNativeLib & {
 		compressSync: (data: Buffer) => Buffer
@@ -205,9 +210,6 @@ describe('snappy small-block fast path', () => {
 		calls.compress = 0 // the async-detection probe
 		return { codec, calls }
 	}
-
-	const json = (bytes: number) =>
-		Buffer.from('{"id":"8f1c","name":"Jane","city":"Detroit"},'.repeat(bytes / 45 + 1)).subarray(0, bytes)
 
 	function xerialFrame(...blocks: Buffer[]): Buffer {
 		const int32 = (n: number) => {
@@ -255,6 +257,33 @@ describe('snappy small-block fast path', () => {
 
 		await expect(codec.decompress(Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]))).rejects.toThrow()
 		expect(calls.uncompress).toBe(1)
+	})
+})
+
+describe('gzip codec', () => {
+	it('round-trips payloads on both sides of the sync size limits', async () => {
+		for (const size of [100, 6 * 1024, 48 * 1024, 300 * 1024]) {
+			const payload = json(size)
+			const compressed = await gzipCodec.compress(payload)
+			expect(gunzipSync(compressed).equals(payload)).toBe(true)
+			expect((await gzipCodec.decompress(compressed)).equals(payload)).toBe(true)
+		}
+	})
+
+	it('decodes concatenated members whatever the last trailer claims', async () => {
+		const [big, bigger, tail] = [json(200 * 1024), json(300 * 1024), Buffer.from('tail')]
+
+		const understated = Buffer.concat([gzipSync(big), gzipSync(tail)])
+		expect((await gzipCodec.decompress(understated)).equals(Buffer.concat([big, tail]))).toBe(true)
+		const chunked = Buffer.concat([gzipSync(bigger), gzipSync(big)])
+		expect((await gzipCodec.decompress(chunked)).equals(Buffer.concat([bigger, big]))).toBe(true)
+	})
+
+	it('rejects corrupt input instead of throwing synchronously', async () => {
+		const corrupt = Buffer.from('definitely not a gzip stream')
+		let result: Promise<Buffer> | undefined
+		expect(() => (result = gzipCodec.decompress(corrupt))).not.toThrow()
+		await expect(result).rejects.toThrow()
 	})
 })
 

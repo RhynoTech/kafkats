@@ -7,7 +7,7 @@
  *   or pluggable via manual registration
  */
 
-import { gzipSync, gunzipSync } from 'node:zlib'
+import { gunzip, gunzipSync, gzip, gzipSync } from 'node:zlib'
 
 /**
  * Compression type identifiers (stored in RecordBatch attributes)
@@ -43,16 +43,43 @@ export interface SyncCompressionCodec extends CompressionCodec {
 	decompressSync(data: Buffer): Buffer
 }
 
+// Below these sizes synchronous zlib costs the event loop less than the async API, which pays
+// about 70-110 µs of main-thread time per call to drive its stream through the threadpool.
+// Measured on JSON records; deflate is about 10x slower than inflate, hence the lower bound.
+const GZIP_SYNC_MAX_INPUT_BYTES = 8 * 1024
+const GZIP_SYNC_MAX_DECODED_BYTES = 64 * 1024
+// The async API inflates into chunkSize buffers, one threadpool round trip each (16 KiB by
+// default). Sizing the chunk from the trailer finishes in one; the cap bounds a corrupt trailer.
+const GUNZIP_MAX_CHUNK_BYTES = 8 * 1024 * 1024
+
+/** Decoded size from the gzip trailer (ISIZE, the last member's length mod 2^32). */
+function gzipDecodedLength(data: Buffer): number {
+	return data.length >= 18 ? data.readUInt32LE(data.length - 4) : 0
+}
+
+function gzipAsync(data: Buffer): Promise<Buffer> {
+	return new Promise((resolve, reject) => gzip(data, (error, result) => (error ? reject(error) : resolve(result))))
+}
+
+function gunzipAsync(data: Buffer, decodedLength: number): Promise<Buffer> {
+	// One byte of slack lets inflate reach the end of the stream without starting a second chunk
+	const chunkSize = Math.min(decodedLength + 1, GUNZIP_MAX_CHUNK_BYTES)
+	return new Promise((resolve, reject) =>
+		gunzip(data, { chunkSize }, (error, result) => (error ? reject(error) : resolve(result)))
+	)
+}
+
 /**
  * GZIP codec using Node.js built-in zlib
  */
 export const gzipCodec: SyncCompressionCodec = {
-	compress(data: Buffer): Promise<Buffer> {
-		return Promise.resolve(gzipSync(data))
+	async compress(data: Buffer): Promise<Buffer> {
+		return data.length <= GZIP_SYNC_MAX_INPUT_BYTES ? gzipSync(data) : gzipAsync(data)
 	},
 
-	decompress(data: Buffer): Promise<Buffer> {
-		return Promise.resolve(gunzipSync(data))
+	async decompress(data: Buffer): Promise<Buffer> {
+		const decodedLength = gzipDecodedLength(data)
+		return decodedLength <= GZIP_SYNC_MAX_DECODED_BYTES ? gunzipSync(data) : gunzipAsync(data, decodedLength)
 	},
 
 	compressSync(data: Buffer): Buffer {
