@@ -110,4 +110,35 @@ describe('FetchManager after a failed fetch', () => {
 		expect(cluster.refreshMetadata.mock.calls.length).toBeLessThanOrEqual(deadLookups)
 		expect(healthy.fetch.mock.calls.length).toBeGreaterThanOrEqual(5)
 	})
+
+	it('does not refresh metadata for a fetch that fails after stop', async () => {
+		let failFetch: (error: Error) => void = () => {}
+		const broker = {
+			nodeId: 1,
+			fetch: vi.fn(
+				() =>
+					new Promise((_resolve, reject) => {
+						failFetch = reject
+					})
+			),
+			closeFetchSession: vi.fn().mockResolvedValue(undefined),
+		}
+		const cluster = {
+			getLeaderForPartition: vi.fn().mockResolvedValue(broker),
+			refreshMetadata: vi.fn().mockResolvedValue(undefined),
+		}
+		const fm = createFetchManager(cluster)
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+
+		const polling = fm.poll()
+		await vi.waitFor(() => expect(broker.fetch).toHaveBeenCalled(), { timeout: 1000 })
+		await fm.stop()
+		await polling
+		// Closing the client's connections rejects the long poll still in flight.
+		failFetch(new Error('Connection closing'))
+		await new Promise(resolve => setTimeout(resolve, 50))
+
+		// A refresh now would reconnect a broker the client is closing, and nothing would close it again.
+		expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+	})
 })

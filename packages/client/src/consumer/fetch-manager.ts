@@ -1169,7 +1169,10 @@ export class FetchManager {
 			for (const state of partitions) {
 				if (state.cachedLeader === broker) state.cachedLeader = null
 			}
-			await this.cluster.refreshMetadata([...new Set(partitions.map(state => state.topic))]).catch(() => {})
+			// After stop() the client may be closing its connections, and a refresh would reopen one.
+			if (this.running) {
+				await this.cluster.refreshMetadata([...new Set(partitions.map(state => state.topic))]).catch(() => {})
+			}
 			throw error
 		}
 
