@@ -3,28 +3,31 @@ import { describe, expect, it, vi } from 'vitest'
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { encodeBatch } from './helpers/completed-fetch.js'
 
-const FETCH_RESPONSE = {
-	topics: [
-		{
-			topic: 't',
-			partitions: [
-				{
-					partitionIndex: 0,
-					errorCode: ErrorCode.None,
-					highWatermark: 50n,
-					lastStableOffset: 50n,
-					logStartOffset: 0n,
-					abortedTransactions: null,
-					preferredReadReplica: -1,
-					recordsData: Buffer.from('non-empty'),
-				},
-			],
-		},
-	],
-	throttleTimeMs: 0,
-	errorCode: ErrorCode.None,
-	sessionId: 0,
+function responseWith(offsets: bigint[]) {
+	return {
+		topics: [
+			{
+				topic: 't',
+				partitions: [
+					{
+						partitionIndex: 0,
+						errorCode: ErrorCode.None,
+						highWatermark: 50n,
+						lastStableOffset: 50n,
+						logStartOffset: 0n,
+						abortedTransactions: null,
+						preferredReadReplica: -1,
+						recordsData: encodeBatch(offsets),
+					},
+				],
+			},
+		],
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		sessionId: 0,
+	}
 }
 
 describe('FetchManager response fencing', () => {
@@ -73,13 +76,7 @@ describe('FetchManager response fencing', () => {
 		}
 
 		// Stale records (offsets 12-13) that would clobber the fresh state's offset of 100n without the fence.
-		fmAny.decodeRecords = vi.fn().mockReturnValue({
-			records: [
-				{ offset: 12n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-				{ offset: 13n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-			],
-			nextOffset: 14n,
-		})
+		const response = responseWith([12n, 13n])
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const oldState = fmAny.partitionStates.get('t:0')
@@ -92,7 +89,7 @@ describe('FetchManager response fencing', () => {
 		expect(newState).not.toBe(oldState)
 		expect(newState.offset).toBe(100n)
 
-		resolveFetch(FETCH_RESPONSE)
+		resolveFetch(response)
 
 		await inflight
 
@@ -143,13 +140,7 @@ describe('FetchManager response fencing', () => {
 			isFull: () => false,
 		}
 
-		fmAny.decodeRecords = vi.fn().mockReturnValue({
-			records: [
-				{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-				{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-			],
-			nextOffset: 12n,
-		})
+		const response = responseWith([10n, 11n])
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
@@ -159,7 +150,7 @@ describe('FetchManager response fencing', () => {
 		// Pause the partition while its fetch is still in flight.
 		fm.pausePartitions([{ topic: 't', partition: 0 }])
 
-		resolveFetch(FETCH_RESPONSE)
+		resolveFetch(response)
 
 		await inflight
 
@@ -212,13 +203,7 @@ describe('FetchManager response fencing', () => {
 			isFull: () => false,
 		}
 
-		fmAny.decodeRecords = vi.fn().mockReturnValue({
-			records: [
-				{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-				{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-			],
-			nextOffset: 12n,
-		})
+		const response = responseWith([10n, 11n])
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
@@ -228,7 +213,7 @@ describe('FetchManager response fencing', () => {
 		// Seek (backward) while the fetch issued at offset 10 is in flight.
 		fm.seekPartition('t', 0, 5n)
 
-		resolveFetch(FETCH_RESPONSE)
+		resolveFetch(response)
 
 		await inflight
 

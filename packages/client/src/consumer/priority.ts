@@ -1,7 +1,7 @@
 export interface SchedulerPartition {
 	topic: string
 	partition: number
-	/** Estimated bytes buffered but not yet delivered. */
+	/** Fetched bytes held but not yet delivered, compressed batches at their compressed size. */
 	bufferedBytes: number
 	busy: boolean
 }

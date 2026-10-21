@@ -4,87 +4,38 @@
  * Handles:
  * - Fetching records from assigned partitions
  * - Managing partition concurrency
- * - Decoding record batches
+ * - Decoding record batches as they are delivered
  */
 
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { KafkaProtocolError } from '@/client/errors.js'
-import {
-	decodeRecordBatchFrom,
-	decodeRecordBatchFromSync,
-	isControlBatch,
-	isTransactional,
-} from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
-import { Decoder } from '@/protocol/primitives/decoder.js'
 import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
+import { CompletedFetch, readFetchedRecords, type FetchedRecords } from './completed-fetch.js'
 
-/**
- * True when the bytes at the decoder's position cannot hold the batch they declare: either the
- * 12-byte preamble (baseOffset + batchLength) is cut off, or fewer than `12 + batchLength` bytes
- * remain. The broker may legally cut the trailing batch at maxBytes; only that case may be
- * skipped - decode failures on a fully-present batch are corruption.
- */
-function isTruncatedTrailingBatch(decoder: Decoder): boolean {
-	if (decoder.remaining() < 12) {
-		return true
-	}
-	const batchStart = decoder.offset()
-	decoder.seek(batchStart + 8) // skip baseOffset(int64)
-	const batchLength = decoder.readInt32()
-	decoder.seek(batchStart)
-	return decoder.remaining() < 12 + batchLength
-}
-
-function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): DecodedRecord[] {
-	if (records.length === 0) {
-		return records
-	}
-
-	if (records[0]!.offset >= minOffset) {
-		return records
-	}
-	let start = 0
-	while (start < records.length && records[start]!.offset < minOffset) {
-		start++
-	}
-
-	return start === 0 ? records : records.slice(start)
-}
-
-/** Estimated in-memory size of a decoded record; drives buffer accounting and the per-partition batch cap. */
+/** Estimated in-memory size of a decoded record; drives the per-partition batch cap and the poll budget. */
 function recordBytes(record: DecodedRecord): number {
 	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
 }
 
-/**
- * Completed fetch from a single partition
- * Similar to Java client's CompletedFetch
- */
-interface CompletedFetch {
-	topic: string
-	partition: number
-	records: DecodedRecord[]
-	// Assignment epoch of the partition when the fetch was buffered (see
-	// FetchManager.assignmentEpochs). Stale batches are fenced by comparing this
-	// against the current epoch at delivery time.
-	assignmentEpoch: number
+function corruptDataError(topic: string, partition: number, offset: bigint, cause: unknown): Error {
+	const message = cause instanceof Error ? cause.message : String(cause)
+	return new Error(
+		`Failed to decode record batch (corrupt data) for ${topic}-${partition} at offset ${offset}: ${message}`
+	)
 }
 
-interface BufferedFetch {
-	topic: string
-	partition: number
-	records: Array<DecodedRecord | null>
-	byteSize: number
-	assignmentEpoch: number
-	nextRecord: number
+/** A partition whose buffered data failed to decode during a drain. */
+interface DrainFailure {
+	fetch: CompletedFetch
+	error: unknown
 }
 
 /** Per-partition aggregate of buffered-but-undelivered bytes, for priority scheduling. */
@@ -98,10 +49,12 @@ interface BufferedPartitionStats {
 type PartitionKeys = Pick<ReadonlySet<string>, 'has'>
 
 /**
- * Buffer for completed fetches with memory bounding and wait/signal
+ * Buffer for completed fetches with memory bounding and wait/signal. It counts the bytes it holds:
+ * record batches as fetched, compressed ones at their compressed size, plus any batch a drain left
+ * decompressed part-way through.
  */
 class FetchBuffer {
-	private queue: BufferedFetch[] = []
+	private queue: CompletedFetch[] = []
 	private bufferedBytes = 0
 	private reservedBytes = 0
 	private waiters: Array<(force?: boolean) => void> = []
@@ -117,26 +70,29 @@ class FetchBuffer {
 	 * Add a completed fetch to the buffer and signal any waiters
 	 */
 	add(fetch: CompletedFetch): void {
-		let byteSize = 0
-		for (const record of fetch.records) byteSize += recordBytes(record)
-		this.queue.push({ ...fetch, byteSize, nextRecord: 0 })
-		this.bufferedBytes += byteSize
+		this.queue.push(fetch)
+		this.bufferedBytes += fetch.heldBytes
 		this.signalWaiters()
 	}
 
 	/**
 	 * Drain one batch per partition and assignment epoch, coalescing that partition's buffered
-	 * fetches up to `maxBytesPerPartition` estimated bytes. Each batch takes at least one record so
-	 * an oversized record still makes progress. Planned partitions go first, in plan order and capped
-	 * per entry, then the remaining partitions FIFO. A poll stops starting partitions once it has used
-	 * `maxBytesPerPartition` of budget; served partitions rotate behind the others for the next poll.
+	 * fetches up to `maxBytesPerPartition` estimated bytes and decoding only the records it takes.
+	 * Each batch takes at least one record so an oversized record still makes progress. Planned
+	 * partitions go first, in plan order and capped per entry, then the remaining partitions FIFO. A
+	 * poll stops starting partitions once it has used `maxBytesPerPartition` of budget; served
+	 * partitions rotate behind the others for the next poll.
+	 *
+	 * A partition discarded (paused, seeked, revoked) while the drain awaits decompression is left
+	 * out of the result. A partition whose data fails to decode returns the records before the bad
+	 * one and a failure.
 	 */
-	drain(
+	async drain(
 		maxBytesPerPartition: number,
 		excludedPartitions?: PartitionKeys,
 		plan: ScheduleDecision['drain'] = []
-	): CompletedFetch[] {
-		const byPartition = new Map<string, BufferedFetch[]>()
+	): Promise<{ batches: PartitionBatch[]; failures: DrainFailure[] }> {
+		const byPartition = new Map<string, CompletedFetch[]>()
 		for (const fetch of this.queue) {
 			const key = tpKey(fetch.topic, fetch.partition)
 			if (excludedPartitions?.has(key)) continue
@@ -145,37 +101,47 @@ class FetchBuffer {
 			else byPartition.set(key, [fetch])
 		}
 
-		const drained = new Map<string, CompletedFetch>()
+		const drained = new Map<string, PartitionBatch>()
 		const served = new Set<string>()
+		const failures: DrainFailure[] = []
 		// Bytes charged against the poll budget. A partition is charged at most its own allowance, so
 		// an oversized first record cannot crowd out the partitions planned after it.
 		let budgetUsed = 0
 
-		const take = (partitionKey: string, maxBytes: number): void => {
+		const take = async (partitionKey: string, maxBytes: number): Promise<void> => {
 			let takenBytes = 0
 			for (const fetch of byPartition.get(partitionKey)!) {
 				const key = `${partitionKey}\0${fetch.assignmentEpoch}`
 				let batch = drained.get(key)
-				while (fetch.nextRecord < fetch.records.length) {
-					const record = fetch.records[fetch.nextRecord]!
-					const size = recordBytes(record)
-					if (takenBytes > 0 && takenBytes + size > maxBytes) break
-					if (!batch) {
-						batch = {
-							topic: fetch.topic,
-							partition: fetch.partition,
-							records: [],
-							assignmentEpoch: fetch.assignmentEpoch,
+				let full = false
+				try {
+					for (;;) {
+						const peeked = fetch.peek()
+						const record = peeked instanceof Promise ? await peeked : peeked
+						if (record === null) break
+						const size = recordBytes(record)
+						if (takenBytes > 0 && takenBytes + size > maxBytes) {
+							full = true
+							break
 						}
-						drained.set(key, batch)
+						if (!batch) {
+							batch = {
+								topic: fetch.topic,
+								partition: fetch.partition,
+								records: [],
+								assignmentEpoch: fetch.assignmentEpoch,
+							}
+							drained.set(key, batch)
+						}
+						batch.records.push(record)
+						fetch.consume()
+						takenBytes += size
 					}
-					batch.records.push(record)
-					fetch.records[fetch.nextRecord++] = null
-					fetch.byteSize -= size
-					this.bufferedBytes -= size
-					takenBytes += size
+				} catch (error) {
+					failures.push({ fetch, error })
+					full = true
 				}
-				if (fetch.nextRecord < fetch.records.length) break
+				if (full) break
 			}
 			served.add(partitionKey)
 			budgetUsed += Math.min(takenBytes, maxBytes)
@@ -186,23 +152,32 @@ class FetchBuffer {
 			const partitionKey = tpKey(entry.topic, entry.partition)
 			if (served.has(partitionKey) || !byPartition.has(partitionKey)) continue
 			const maxBytes = Math.min(entry.maxBytes, maxBytesPerPartition)
-			take(partitionKey, maxBytes > 0 ? maxBytes : 0)
+			await take(partitionKey, maxBytes > 0 ? maxBytes : 0)
 		}
 		for (const partitionKey of byPartition.keys()) {
 			if (budgetUsed >= maxBytesPerPartition) break
-			if (!served.has(partitionKey)) take(partitionKey, maxBytesPerPartition)
+			if (!served.has(partitionKey)) await take(partitionKey, maxBytesPerPartition)
 		}
 
-		const untouched: BufferedFetch[] = []
-		const rotated: BufferedFetch[] = []
+		const kept = (partitionKey: string) => !byPartition.get(partitionKey)!.some(fetch => fetch.dropped)
+		const batches: PartitionBatch[] = []
+		for (const batch of drained.values()) {
+			if (kept(tpKey(batch.topic, batch.partition))) batches.push(batch)
+		}
+		for (const partitionKey of served) {
+			if (kept(partitionKey)) for (const fetch of byPartition.get(partitionKey)!) fetch.commit()
+		}
+
+		const untouched: CompletedFetch[] = []
+		const rotated: CompletedFetch[] = []
 		for (const fetch of this.queue) {
-			if (fetch.nextRecord >= fetch.records.length) continue
+			if (fetch.isEmpty) continue
 			const target = served.has(tpKey(fetch.topic, fetch.partition)) ? rotated : untouched
 			target.push(fetch)
 		}
 		this.queue = [...untouched, ...rotated]
-		this.signalCapacityWaiter()
-		return Array.from(drained.values())
+		this.recount()
+		return { batches, failures: failures.filter(failure => !failure.fetch.dropped) }
 	}
 
 	/** Aggregate buffered bytes per partition, in queue (first-seen) order. */
@@ -211,8 +186,8 @@ class FetchBuffer {
 		for (const fetch of this.queue) {
 			const key = tpKey(fetch.topic, fetch.partition)
 			const existing = stats.get(key)
-			if (existing) existing.bytes += fetch.byteSize
-			else stats.set(key, { topic: fetch.topic, partition: fetch.partition, bytes: fetch.byteSize })
+			if (existing) existing.bytes += fetch.heldBytes
+			else stats.set(key, { topic: fetch.topic, partition: fetch.partition, bytes: fetch.heldBytes })
 		}
 		return Array.from(stats.values())
 	}
@@ -339,26 +314,14 @@ class FetchBuffer {
 	 * Clear all buffered data
 	 */
 	clear(): void {
-		this.queue = []
-		this.bufferedBytes = 0
-		this.signalCapacityWaiter()
+		this.retain(() => false)
 	}
 
 	/**
 	 * Remove buffered data for partitions not in the given set
 	 */
 	removePartitionsNotIn(validKeys: Set<string>): void {
-		let newBytes = 0
-		const filtered: BufferedFetch[] = []
-		for (const f of this.queue) {
-			if (validKeys.has(tpKey(f.topic, f.partition))) {
-				filtered.push(f)
-				newBytes += f.byteSize
-			}
-		}
-		this.queue = filtered
-		this.bufferedBytes = newBytes
-		this.signalCapacityWaiter()
+		this.retain(fetch => validKeys.has(tpKey(fetch.topic, fetch.partition)))
 	}
 
 	/**
@@ -367,50 +330,42 @@ class FetchBuffer {
 	removePartitions(partitions: Array<{ topic: string; partition: number }>): void {
 		if (partitions.length === 0) return
 		const keysToRemove = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
-		let newBytes = 0
-		const filtered: BufferedFetch[] = []
-		for (const f of this.queue) {
-			if (!keysToRemove.has(tpKey(f.topic, f.partition))) {
-				filtered.push(f)
-				newBytes += f.byteSize
-			}
-		}
-		this.queue = filtered
-		this.bufferedBytes = newBytes
-		this.signalCapacityWaiter()
+		this.retain(fetch => !keysToRemove.has(tpKey(fetch.topic, fetch.partition)))
 	}
 
 	/**
-	 * Remove buffered data for specific partitions, returning the earliest buffered record offset
-	 * per partition that had buffered data. Used by pause(): the buffered records were never
-	 * delivered but the fetch offset already advanced past them, so the caller rewinds to the
-	 * earliest offset to re-fetch (and re-deliver) them on resume instead of dropping them.
+	 * Remove buffered data for specific partitions, returning per partition that had buffered data
+	 * the offset to re-fetch from to get its undelivered records back. Used by pause(): the buffered
+	 * records were never delivered but the fetch offset already advanced past them, so the caller
+	 * rewinds to re-fetch (and re-deliver) them on resume instead of dropping them.
 	 */
 	removePartitionsReturningEarliest(partitions: Array<{ topic: string; partition: number }>): Map<string, bigint> {
 		const earliest = new Map<string, bigint>()
 		if (partitions.length === 0) return earliest
 		const keysToRemove = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
-		let newBytes = 0
-		const filtered: BufferedFetch[] = []
-		for (const f of this.queue) {
-			const key = tpKey(f.topic, f.partition)
-			if (!keysToRemove.has(key)) {
-				filtered.push(f)
-				newBytes += f.byteSize
-				continue
-			}
-			for (let index = f.nextRecord; index < f.records.length; index++) {
-				const record = f.records[index]!
-				const current = earliest.get(key)
-				if (current === undefined || record.offset < current) {
-					earliest.set(key, record.offset)
-				}
-			}
-		}
-		this.queue = filtered
-		this.bufferedBytes = newBytes
-		this.signalCapacityWaiter()
+		this.retain(fetch => {
+			const key = tpKey(fetch.topic, fetch.partition)
+			if (!keysToRemove.has(key)) return true
+			const current = earliest.get(key)
+			if (current === undefined || fetch.position < current) earliest.set(key, fetch.position)
+			return false
+		})
 		return earliest
+	}
+
+	private retain(keep: (fetch: CompletedFetch) => boolean): void {
+		this.queue = this.queue.filter(fetch => {
+			if (keep(fetch)) return true
+			fetch.dropped = true
+			return false
+		})
+		this.recount()
+	}
+
+	private recount(): void {
+		this.bufferedBytes = 0
+		for (const fetch of this.queue) this.bufferedBytes += fetch.heldBytes
+		this.signalCapacityWaiter()
 	}
 }
 
@@ -443,11 +398,13 @@ export interface FetchManagerConfig {
 	/** Verify the CRC32C of each fetched batch (default true). See ConsumerConfig.checkCrcs. */
 	checkCrcs?: boolean
 	/**
-	 * Target maximum bytes to buffer for poll() mode. Kafka may return one oversized first
-	 * record batch per in-flight broker request. Default: maxBytesPerPartition * 10.
+	 * Maximum bytes of fetched data to hold for poll() mode, counted exactly as held: record
+	 * batches as fetched (compressed ones at their compressed size), plus a batch a poll left
+	 * decompressed part-way through, at most one per partition. Kafka may also return one oversized
+	 * first record batch per in-flight broker request. Default: maxBytesPerPartition * 10.
 	 */
 	maxBufferedBytes?: number
-	/** Called whenever a decoded batch range advances the fetch position. */
+	/** Called whenever a fetched batch range advances the fetch position. */
 	onFetchPosition?: (position: TopicPartitionOffset, recordCount: number) => void
 	priority?: PriorityStrategy
 }
@@ -462,21 +419,6 @@ export const DEFAULT_FETCH_CONFIG: FetchManagerConfig = {
 	partitionConcurrency: 1,
 	isolationLevel: 'read_committed',
 	checkCrcs: true,
-}
-
-/**
- * Result of decoding a fetch response's record data.
- *
- * `records` are the user-visible records (control batches dropped, aborted-transaction records
- * filtered for read_committed). `nextOffset` is the offset immediately after the last decoded
- * batch (max over batches of baseOffset + lastOffsetDelta + 1), or null when no batch decoded.
- * The caller advances the fetch position to `nextOffset` even when `records` is empty — a batch
- * that is entirely control records, fully aborted, or empty/compacted yields zero records but
- * must still advance the position, otherwise the same offset is re-fetched forever.
- */
-interface DecodedBatchResult {
-	records: DecodedRecord[]
-	nextOffset: bigint | null
 }
 
 /**
@@ -1073,45 +1015,47 @@ export class FetchManager {
 
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
 					const fetchOffset = state.offset
-					const decodeResult = this.decodeRecords(
-						partitionResponse.recordsData,
-						partitionResponse.abortedTransactions,
-						partitionResponse.lastStableOffset
-					)
-					const { records: decoded, nextOffset } =
-						decodeResult instanceof Promise ? await decodeResult : decodeResult
-
-					// decodeRecords may have awaited; re-fence (revoked, paused, or seeked mid-decode).
-					if (
+					const stale = () =>
 						state.abortController.signal.aborted ||
 						state.paused ||
 						state.fetchEpoch !== issuedEpochByKey.get(key)
-					)
-						continue
-
-					const records = filterRecordsFromOffset(decoded, fetchOffset)
-
-					if (records.length > 0) {
-						this.fetchBuffer.add({
-							topic: state.topic,
-							partition: state.partition,
-							records,
-							assignmentEpoch: this.getAssignmentEpoch(state.topic, state.partition),
+					let fetched: FetchedRecords
+					try {
+						const read = readFetchedRecords(partitionResponse.recordsData, {
+							fetchOffset,
+							abortedTransactions: partitionResponse.abortedTransactions,
+							lastStableOffset: partitionResponse.lastStableOffset,
+							readCommitted: this.config.isolationLevel === 'read_committed',
+							verifyCrc: this.config.checkCrcs !== false,
 						})
+						fetched = read instanceof Promise ? await read : read
+					} catch (error) {
+						// Re-fetching returns the same bytes, so this is surfaced like a broker CORRUPT_MESSAGE,
+						// with the position left at the bad batch for the user to seek past.
+						if (!stale())
+							this.pendingError = corruptDataError(state.topic, state.partition, fetchOffset, error)
+						continue
 					}
 
-					// Advance the fetch position past the whole decoded batch range, even when no
+					// Reading may have awaited a decode; re-fence (revoked, paused, or seeked meanwhile).
+					if (stale()) continue
+
+					if (fetched.recordCount > 0) {
+						const assignmentEpoch = this.getAssignmentEpoch(state.topic, state.partition)
+						this.fetchBuffer.add(new CompletedFetch(state.topic, state.partition, assignmentEpoch, fetched))
+					}
+
+					// Advance the fetch position past the whole fetched batch range, even when no
 					// records survived (all aborted / control-only / empty-compacted) — otherwise the
 					// position never moves and the same offset is re-fetched forever. nextOffset is the
 					// batch-declared end (>= last record offset + 1), which also steps over a compacted
 					// tail. Guarded by `> state.offset` so a stale/overlapping batch can't rewind.
-					const advanceTo =
-						nextOffset ?? (records.length > 0 ? records[records.length - 1]!.offset + 1n : null)
+					const advanceTo = fetched.nextOffset
 					if (advanceTo !== null && advanceTo > state.offset) {
 						state.offset = advanceTo
 						this.config.onFetchPosition?.(
 							{ topic: state.topic, partition: state.partition, offset: advanceTo },
-							records.length
+							fetched.recordCount
 						)
 					}
 				}
@@ -1178,14 +1122,35 @@ export class FetchManager {
 	/**
 	 * Drain buffer and return completed fetches directly
 	 */
-	private drainBuffer(excludedPartitions?: PartitionKeys): PartitionBatch[] {
+	private async drainBuffer(excludedPartitions?: PartitionKeys): Promise<PartitionBatch[]> {
 		const fetchBuffer = this.fetchBuffer
 		if (!fetchBuffer) return []
 		const { maxBytesPerPartition, priority } = this.config
-		if (!priority) return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions)
-		this.lastExcluded = excludedPartitions
-		const decision = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions))
-		return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, decision.drain)
+		let plan: ScheduleDecision['drain'] | undefined
+		if (priority) {
+			this.lastExcluded = excludedPartitions
+			plan = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions)).drain
+		}
+		const { batches, failures } = await fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, plan)
+		for (const { fetch, error } of failures) this.failCorruptFetch(fetch, error)
+		return batches
+	}
+
+	/**
+	 * Surface data that failed to decode during a drain like a broker CORRUPT_MESSAGE, after the
+	 * records before it are delivered. The fetch position rewinds to the first undelivered record,
+	 * which re-fetching would fail on again, so the user can seek past it.
+	 */
+	private failCorruptFetch(fetch: CompletedFetch, error: unknown): void {
+		const { topic, partition } = fetch
+		this.fetchBuffer?.removePartitions([{ topic, partition }])
+		const state = this.partitionStates.get(tpKey(topic, partition))
+		if (state && fetch.assignmentEpoch === this.getAssignmentEpoch(topic, partition)) {
+			state.offset = fetch.position
+			// Fence a fetch already issued past the bad batch so it cannot move the position again.
+			state.fetchEpoch++
+		}
+		this.pendingError = corruptDataError(topic, partition, fetch.position, error)
 	}
 
 	/** Buffered partitions first (in buffer order), then idle assigned partitions with zero buffered. */
@@ -1214,221 +1179,5 @@ export class FetchManager {
 			bufferCapacityBytes: fetchBuffer.maxBytes,
 			bufferedBytes: fetchBuffer.sizeBytes,
 		}
-	}
-
-	/**
-	 * Decode records from raw buffer
-	 * Returns DecodedRecord[] directly for better performance (avoids intermediate Message creation)
-	 * Returns sync result or Promise depending on whether compression is encountered
-	 */
-	private decodeRecords(
-		data: Buffer,
-		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
-		lastStableOffset: bigint
-	): DecodedBatchResult | Promise<DecodedBatchResult> {
-		const decoder = new Decoder(data)
-
-		// Decode all record batches first so we can:
-		// - drop control batches
-		// - filter aborted transactional records for read_committed
-		const batches: Array<{
-			attributes: number
-			producerId: bigint
-			baseOffset: bigint
-			lastOffsetDelta: number
-			records: DecodedRecord[]
-		}> = []
-
-		// Try synchronous decoding first (faster, no promise overhead)
-		let needsAsync = false
-		while (decoder.remaining() > 0) {
-			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
-			// underflow). The broker always returns the FIRST batch complete, so underflow with
-			// nothing decoded is corruption; and any decode failure on a fully-present batch
-			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
-			// silently drop records and leave the partition re-fetching the same data forever.
-			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
-				break
-			}
-			try {
-				// Hot-path decode options:
-				// - Assume sequential offsets to avoid per-record BigInt conversions
-				const batch = decodeRecordBatchFromSync(decoder, {
-					assumeSequentialOffsets: true,
-					verifyCrc: this.config.checkCrcs !== false,
-				})
-				batches.push(batch)
-			} catch (e) {
-				// If sync failed due to compression, switch to async path
-				if ((e as Error).message.includes('cannot decode compressed')) {
-					needsAsync = true
-					break
-				}
-				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
-			}
-		}
-
-		// If compression was encountered, use async decode
-		if (needsAsync) {
-			return this.decodeRecordsAsync(data, abortedTransactions, lastStableOffset)
-		}
-
-		// Sync path - process batches directly
-		return this.processBatches(batches, abortedTransactions, lastStableOffset)
-	}
-
-	/**
-	 * Async decode path for compressed batches
-	 */
-	private async decodeRecordsAsync(
-		data: Buffer,
-		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
-		lastStableOffset: bigint
-	): Promise<DecodedBatchResult> {
-		const decoder = new Decoder(data)
-		const batches: Array<{
-			attributes: number
-			producerId: bigint
-			baseOffset: bigint
-			lastOffsetDelta: number
-			records: DecodedRecord[]
-		}> = []
-
-		while (decoder.remaining() > 0) {
-			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
-			// underflow). The broker always returns the FIRST batch complete, so underflow with
-			// nothing decoded is corruption; and any decode failure on a fully-present batch
-			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
-			// silently drop records and leave the partition re-fetching the same data forever.
-			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
-				break
-			}
-			try {
-				// Hot-path decode options:
-				// - Assume sequential offsets to avoid per-record BigInt conversions
-				const batch = await decodeRecordBatchFrom(decoder, {
-					assumeSequentialOffsets: true,
-					verifyCrc: this.config.checkCrcs !== false,
-				})
-				batches.push(batch)
-			} catch (e) {
-				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
-			}
-		}
-
-		return this.processBatches(batches, abortedTransactions, lastStableOffset)
-	}
-
-	/**
-	 * Process decoded batches into records
-	 */
-	private processBatches(
-		batches: Array<{
-			attributes: number
-			producerId: bigint
-			baseOffset: bigint
-			lastOffsetDelta: number
-			records: DecodedRecord[]
-		}>,
-		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
-		lastStableOffset: bigint
-	): DecodedBatchResult {
-		// Offset immediately after the last decoded batch, across ALL batches (data, control, and
-		// empty). The caller advances the fetch position here even when no user records survive.
-		let nextOffset: bigint | null = null
-		for (const batch of batches) {
-			const end = batch.baseOffset + BigInt(batch.lastOffsetDelta) + 1n
-			if (nextOffset === null || end > nextOffset) {
-				nextOffset = end
-			}
-		}
-
-		// Pre-compute aborted transaction ranges (exclusive end offset)
-		const abortedRanges: Array<{ producerId: bigint; start: bigint; endExclusive: bigint }> = []
-		if (this.config.isolationLevel === 'read_committed' && abortedTransactions.length > 0) {
-			// Control batches act as transaction markers; use the next marker offset as the end of the transaction.
-			const controlBatches = batches
-				.filter(b => isControlBatch(b.attributes))
-				.map(b => ({ producerId: b.producerId, offset: b.baseOffset }))
-				.sort((a, b) => (a.offset < b.offset ? -1 : a.offset > b.offset ? 1 : 0))
-
-			for (const tx of abortedTransactions) {
-				const end =
-					controlBatches.find(cb => cb.producerId === tx.producerId && cb.offset > tx.firstOffset)?.offset ??
-					lastStableOffset
-				abortedRanges.push({ producerId: tx.producerId, start: tx.firstOffset, endExclusive: end })
-			}
-		}
-
-		const result: DecodedRecord[] = []
-
-		// Fast path: no aborted transactional ranges to filter.
-		// This is the common case (non-transactional workloads).
-		if (abortedRanges.length === 0) {
-			if (batches.length === 0) {
-				return { records: result, nextOffset }
-			}
-
-			// Common case: a single non-control batch.
-			// Avoid copying the records array into a new array.
-			if (batches.length === 1) {
-				const batch = batches[0]!
-				if (isControlBatch(batch.attributes)) {
-					return { records: result, nextOffset }
-				}
-				return { records: batch.records, nextOffset }
-			}
-
-			// Multiple batches: pre-size output to avoid repeated growth.
-			let totalRecords = 0
-			for (const batch of batches) {
-				// Control batches contain transactional markers (commit/abort) and should never be exposed as user messages.
-				if (isControlBatch(batch.attributes)) {
-					continue
-				}
-
-				totalRecords += batch.records.length
-			}
-
-			if (totalRecords === 0) {
-				return { records: result, nextOffset }
-			}
-
-			const out = new Array<DecodedRecord>(totalRecords)
-			let outIndex = 0
-			for (const batch of batches) {
-				if (isControlBatch(batch.attributes)) {
-					continue
-				}
-
-				const records = batch.records
-				for (let i = 0; i < records.length; i++) {
-					out[outIndex++] = records[i]!
-				}
-			}
-			return { records: out, nextOffset }
-		}
-
-		for (const batch of batches) {
-			// Control batches contain transactional markers (commit/abort) and should never be exposed as user messages.
-			if (isControlBatch(batch.attributes)) {
-				continue
-			}
-
-			const transactional = isTransactional(batch.attributes)
-			const ranges = transactional ? abortedRanges.filter(r => r.producerId === batch.producerId) : []
-
-			for (const record of batch.records) {
-				// For read_committed, drop records that are part of aborted transactions.
-				if (ranges.length > 0 && ranges.some(r => record.offset >= r.start && record.offset < r.endExclusive)) {
-					continue
-				}
-
-				// Push DecodedRecord directly - consumer will create Message with decoded value
-				result.push(record)
-			}
-		}
-
-		return { records: result, nextOffset }
 	}
 }

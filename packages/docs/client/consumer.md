@@ -64,6 +64,9 @@ await consumer.runBatch('events', async (messages, ctx) => {
 Each batch holds records from one partition, up to the consumer's `maxBytesPerPartition` (estimated from key and
 value sizes). Records fetched ahead while a handler is busy stay buffered for the next batch, so a slow handler never
 receives more than one partition's byte budget at once. A record larger than the limit is delivered on its own.
+Buffered records stay as fetched, compressed, and are decoded only when delivered: the consumer holds up to 10 ×
+`maxBytesPerPartition` of fetched bytes, plus at most one decompressed batch per partition that a delivery stopped
+inside.
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 
@@ -216,10 +219,12 @@ topic must continue making progress. Topics omitted from a strict order share th
 weighted shares receive a share of `1`.
 
 Custom strategies implement `PriorityStrategy` and return ordered `drain` entries, each capped at `maxBytes` out of
-the poll's `byteBudget` (the consumer's `maxBytesPerPartition`), plus the partitions currently allowed to `fetch`. Buffered partitions omitted from `drain` are still delivered FIFO after the planned entries within
-the remaining poll budget, so hold a topic back through `fetch`, not `drain`. Derive fairness from the supplied
-scheduler state: the fetch loop may call `schedule()` without a drain, and a drain decision may be only partially
-applied.
+the poll's `byteBudget` (the consumer's `maxBytesPerPartition`), plus the partitions currently allowed to `fetch`.
+`maxBytes` and `byteBudget` count the estimated decoded size of delivered records, while `bufferedBytes` and
+`bufferCapacityBytes` count fetched bytes, compressed batches at their compressed size. Buffered partitions omitted
+from `drain` are still delivered FIFO after the planned entries within the remaining poll budget, so hold a topic
+back through `fetch`, not `drain`. Derive fairness from the supplied scheduler state: the fetch loop may call
+`schedule()` without a drain, and a drain decision may be only partially applied.
 
 Priority applies at poll granularity. A handler batch already admitted is never preempted; lower `maxBytesPerPartition` for
 finer-grained scheduling when `partitionConcurrency` is small. Literal topic names are checked against the

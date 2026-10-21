@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
+import { completedFetch } from './helpers/completed-fetch.js'
 
 function makeFetchManager(maxBufferedBytes = 1000, maxBytesPerPartition = 1000): FetchManager {
 	const cluster = {
@@ -26,15 +27,6 @@ function makeFetchManager(maxBufferedBytes = 1000, maxBytesPerPartition = 1000):
 	)
 }
 
-// A 36-byte value plus the 64-byte per-record overhead: each record is estimated at 100 bytes.
-function record(offset: bigint, valueBytes = 36) {
-	return { offset, key: null, value: Buffer.alloc(valueBytes) }
-}
-
-function completedFetch(topic: string, partition: number, offsets: bigint[], assignmentEpoch = 0) {
-	return { topic, partition, records: offsets.map(offset => record(offset)), assignmentEpoch }
-}
-
 describe('FetchManager bounded prefetch', () => {
 	it('rotates a partially drained partition behind other buffered partitions', async () => {
 		const manager = makeFetchManager(1000, 300)
@@ -42,12 +34,15 @@ describe('FetchManager bounded prefetch', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const buffer = (manager as any).fetchBuffer
 
-		buffer.add(completedFetch('topic-a', 0, [0n, 1n, 2n, 3n]))
-		buffer.add(completedFetch('topic-b', 0, [5n, 6n]))
+		const topicA = completedFetch('topic-a', 0, [0n, 1n, 2n, 3n])
+		const topicB = completedFetch('topic-b', 0, [5n, 6n])
+		buffer.add(topicA)
+		buffer.add(topicB)
 
 		const first = await manager.poll()
 		expect(first.flatMap(batch => batch.records.map(record => record.offset))).toEqual([0n, 1n, 2n])
-		expect(buffer.remainingCapacity()).toBe(700)
+		// The buffer holds fetched bytes: topic-a's batch stays held until its last record is taken.
+		expect(buffer.remainingCapacity()).toBe(1000 - topicA.heldBytes - topicB.heldBytes)
 
 		const second = await manager.poll()
 		expect(second.flatMap(batch => batch.records.map(record => record.offset))).toEqual([5n, 6n, 3n])
@@ -100,7 +95,8 @@ describe('FetchManager bounded prefetch', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const buffer = (manager as any).fetchBuffer
 
-		buffer.add({ topic: 'topic-a', partition: 0, records: [record(0n, 500), record(1n)], assignmentEpoch: 0 })
+		buffer.add(completedFetch('topic-a', 0, [0n], { valueBytes: 500 }))
+		buffer.add(completedFetch('topic-a', 0, [1n]))
 
 		expect((await manager.poll())[0]!.records.map(record => record.offset)).toEqual([0n])
 		expect((await manager.poll())[0]!.records.map(record => record.offset)).toEqual([1n])
@@ -157,8 +153,8 @@ describe('FetchManager bounded prefetch', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const buffer = (manager as any).fetchBuffer
 
-		buffer.add(completedFetch('topic-a', 0, [0n], 0))
-		buffer.add(completedFetch('topic-a', 0, [1n], 1))
+		buffer.add(completedFetch('topic-a', 0, [0n], { assignmentEpoch: 0 }))
+		buffer.add(completedFetch('topic-a', 0, [1n], { assignmentEpoch: 1 }))
 
 		const batches = await manager.poll()
 		expect(batches).toHaveLength(2)

@@ -2,15 +2,17 @@ import { describe, expect, it, vi } from 'vitest'
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 import { strict } from '@/consumer/priority.js'
+import { completedFetch } from './helpers/completed-fetch.js'
 
 describe('FetchManager priority fetch loop', () => {
 	it('withholds lower tiers until higher tiers cannot fill a poll', async () => {
-		// Records without key or value are estimated at 64 bytes, so two buffered live records fill a poll.
+		// A record with a 36-byte value costs 100 bytes of poll budget and, alone in its batch, 104
+		// bytes of buffer, so two buffered live records fill a poll.
 		const cluster = { getLeaderForPartition: vi.fn(), getLogger: () => null }
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const offsetManager = new OffsetManager(cluster as any, 'g')
 		const manager = new FetchManager(cluster as never, offsetManager, 'earliest', {
-			maxBytesPerPartition: 128,
+			maxBytesPerPartition: 200,
 			minBytes: 1,
 			maxWaitMs: 1,
 			partitionConcurrency: 1,
@@ -21,12 +23,8 @@ describe('FetchManager priority fetch loop', () => {
 		await manager.poll()
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const internal = manager as any
-		internal.fetchBuffer.add({
-			topic: 'live',
-			partition: 0,
-			records: [{ offset: 0n }, { offset: 1n }],
-			assignmentEpoch: 0,
-		})
+		internal.fetchBuffer.add(completedFetch('live', 0, [0n]))
+		internal.fetchBuffer.add(completedFetch('live', 0, [1n]))
 		manager.addPartitions([
 			{ topic: 'live', partition: 0, offset: 2n },
 			{ topic: 'bulk', partition: 0, offset: 0n },

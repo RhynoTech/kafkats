@@ -1,13 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { createRecordBatch, encodeRecordBatchSync } from '@/protocol/records/index.js'
-import type { DecodedRecord } from '@/protocol/records/index.js'
 
-function makeFetchManager(checkCrcs: boolean) {
+async function makeFetchManager(checkCrcs: boolean) {
 	const cluster = {
-		getLeaderForPartition: () => undefined,
+		getLeaderForPartition: vi.fn().mockRejectedValue(new Error('no broker in unit test')),
 		getLogger: () => null,
 	}
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -20,14 +20,40 @@ function makeFetchManager(checkCrcs: boolean) {
 		{
 			maxBytesPerPartition: 1024,
 			minBytes: 1,
-			maxWaitMs: 50,
+			maxWaitMs: 20,
 			partitionConcurrency: 1,
 			isolationLevel: 'read_uncommitted',
 			checkCrcs,
 		}
 	)
+	await fm.poll()
+	fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	return fm as any
+	const fmAny = fm as any
+	const fetch = vi.fn().mockResolvedValue({
+		topics: [
+			{
+				topic: 't',
+				partitions: [
+					{
+						partitionIndex: 0,
+						errorCode: ErrorCode.None,
+						highWatermark: 1n,
+						lastStableOffset: 1n,
+						logStartOffset: 0n,
+						abortedTransactions: [],
+						preferredReadReplica: -1,
+						recordsData: batchWithBadCrc(),
+					},
+				],
+			},
+		],
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		sessionId: 0,
+	})
+	await fmAny.fetchFromBrokerToBuffer({ nodeId: 1, fetch }, [fmAny.partitionStates.get('t:0')], 1048576)
+	return fm
 }
 
 // A valid batch with its CRC field corrupted (the record data itself is intact, so decode
@@ -40,18 +66,18 @@ function batchWithBadCrc(): Buffer {
 }
 
 describe('FetchManager checkCrcs', () => {
-	it('throws on a corrupt batch CRC when checkCrcs is true', () => {
-		const fm = makeFetchManager(true)
-		expect(() => fm.decodeRecords(batchWithBadCrc(), [], 100n)).toThrow(/CRC mismatch/)
+	it('surfaces a corrupt batch CRC from poll() when checkCrcs is true', async () => {
+		const fm = await makeFetchManager(true)
+		await expect(fm.poll()).rejects.toThrow(/CRC mismatch/)
+		fm.stop()
 	})
 
-	it('skips CRC verification and decodes the batch when checkCrcs is false', () => {
-		const fm = makeFetchManager(false)
-		const result = fm.decodeRecords(batchWithBadCrc(), [], 100n) as {
-			records: DecodedRecord[]
-			nextOffset: bigint | null
-		}
-		expect(result).not.toBeInstanceOf(Promise)
-		expect(result.records.map(r => r.value?.toString('utf-8'))).toEqual(['hello'])
+	it('skips CRC verification and decodes the batch when checkCrcs is false', async () => {
+		const fm = await makeFetchManager(false)
+		const batches = await fm.poll()
+		expect(batches.flatMap(batch => batch.records.map(record => record.value?.toString('utf-8')))).toEqual([
+			'hello',
+		])
+		fm.stop()
 	})
 })
