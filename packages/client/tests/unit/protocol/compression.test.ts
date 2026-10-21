@@ -304,6 +304,17 @@ describe('gzip codec', () => {
 		expect((await gzipCodec.decompress(chunked)).equals(Buffer.concat([bigger, big]))).toBe(true)
 	})
 
+	it('does not pin an oversized buffer when bytes after the member overstate the trailer', async () => {
+		// zlib ignores bytes after the gzip member; read as ISIZE, these claim 4 GiB of output
+		const payload = json(10_000)
+		const padded = Buffer.concat([gzipSync(payload), Buffer.from([0, 0, 0, 0xff])])
+
+		const decoded = await gzipCodec.decompress(padded)
+		expect(decoded.equals(payload)).toBe(true)
+		// Record keys and values are views of this buffer, so its whole backing store stays alive
+		expect(decoded.buffer.byteLength).toBeLessThan(2 * payload.length)
+	})
+
 	it('rejects corrupt input instead of throwing synchronously', async () => {
 		const corrupt = Buffer.from('definitely not a gzip stream')
 		let result: Promise<Buffer> | undefined

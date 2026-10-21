@@ -65,7 +65,12 @@ function gunzipAsync(data: Buffer, decodedLength: number): Promise<Buffer> {
 	// One byte of slack lets inflate reach the end of the stream without starting a second chunk
 	const chunkSize = Math.min(decodedLength + 1, GUNZIP_MAX_CHUNK_BYTES)
 	return new Promise((resolve, reject) =>
-		gunzip(data, { chunkSize }, (error, result) => (error ? reject(error) : resolve(result)))
+		gunzip(data, { chunkSize }, (error, result) => {
+			if (error) return reject(error)
+			// One-chunk output is a view of the chunk. Bytes after the member can overstate ISIZE, and
+			// zero-copy record keys and values would then pin the oversized chunk outside FetchBuffer.
+			resolve(result.length < result.buffer.byteLength / 2 ? Buffer.from(result) : result)
+		})
 	)
 }
 
