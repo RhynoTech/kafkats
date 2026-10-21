@@ -253,8 +253,10 @@ describe('FetchManager response slicing', () => {
 		const yields = vi.spyOn(LoopSlice.prototype, 'yield')
 		await deliver(fmAny, Object.fromEntries(partitions.map(partition => [partition, encodeBatch([0n, 1n])])))
 
-		// One yield before the response is read, then one before each partition.
-		expect(yields).toHaveBeenCalledTimes(1 + partitions.length)
+		// One yield before the response is read, then one before each partition. Decoding ahead, which
+		// runs during those yields, has a slice of its own.
+		const responseYields = yields.mock.contexts.filter(slice => slice !== fmAny.fetchBuffer.decodeSlice)
+		expect(responseYields).toHaveLength(1 + partitions.length)
 		expect(fmAny.fetchBuffer.queue.map((fetch: { partition: number }) => fetch.partition)).toEqual(partitions)
 		expect((await fm.poll()).map(batch => [batch.partition, batch.records.length])).toEqual(
 			partitions.map(partition => [partition, 2])
@@ -277,6 +279,67 @@ describe('FetchManager response slicing', () => {
 		expect(fmAny.fetchBuffer.queue.map((fetch: { partition: number }) => fetch.partition)).toEqual([0])
 		expect(fmAny.partitionStates.get('t:0').offset).toBe(2n)
 		expect(fmAny.partitionStates.get('t:1').offset).toBe(0n)
+		fm.stop()
+	})
+})
+
+describe('FetchManager decode slicing', () => {
+	it('yields to the event loop while back-to-back polls decode', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		await deliver(fmAny, { 0: encodeBatch(offsetRange(0n, 40)) })
+
+		let now = performance.now()
+		vi.spyOn(performance, 'now').mockImplementation(() => (now += 1))
+		let turns = 0
+		let polling = true
+		const tick = () => {
+			if (!polling) return
+			turns++
+			setImmediate(tick)
+		}
+		setImmediate(tick)
+		// Handlers that settle without I/O let the next poll start in the same loop turn.
+		const offsets: bigint[] = []
+		while (fmAny.fetchBuffer.hasDataFor()) offsets.push(...offsetsOf(await fm.poll()))
+		polling = false
+
+		expect(offsets).toEqual(offsetRange(0n, 40))
+		expect(turns).toBeGreaterThan(0)
+		fm.stop()
+	})
+
+	it('yields to the event loop while decoding ahead of the next poll', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		vi.spyOn(LoopSlice.prototype, 'expired', 'get').mockReturnValue(true)
+		const yields = vi.spyOn(LoopSlice.prototype, 'yield')
+		await deliver(fmAny, { 0: encodeBatch(offsetRange(0n, 40)) })
+
+		// Ten records fill the next poll's 1024-byte budget, and the eleventh is decoded to find that out.
+		await vi.waitFor(() => expect(fmAny.fetchBuffer.queue[0].tail).toBe(11))
+		const decodeYields = yields.mock.contexts.filter(slice => slice === fmAny.fetchBuffer.decodeSlice)
+		expect(decodeYields.length).toBeGreaterThanOrEqual(11)
+		expect(offsetsOf(await fm.poll())).toEqual(offsetRange(0n, 10))
+		fm.stop()
+	})
+
+	it('neither decodes nor delivers a partition paused while a poll yielded before it', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([0, 1].map(partition => ({ topic: 't', partition, offset: 0n })))
+		await deliver(fmAny, { 0: await gzipBatch([0n, 1n]), 1: await gzipBatch([0n, 1n]) })
+		const decompress = vi.spyOn(gzipCodec, 'decompress')
+		vi.spyOn(LoopSlice.prototype, 'expired', 'get').mockReturnValue(true)
+		const yieldOnce = LoopSlice.prototype.yield
+		let yields = 0
+		vi.spyOn(LoopSlice.prototype, 'yield').mockImplementation(function (this: LoopSlice) {
+			if (++yields === 1) fm.pausePartitions([{ topic: 't', partition: 0 }])
+			return yieldOnce.call(this)
+		})
+
+		expect((await fm.poll()).map(batch => [batch.partition, offsetsOf([batch])])).toEqual([[1, [0n, 1n]]])
+		expect(decompress).toHaveBeenCalledOnce()
+		expect(fmAny.partitionStates.get('t:0').offset).toBe(0n)
 		fm.stop()
 	})
 })

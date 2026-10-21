@@ -37,6 +37,13 @@ function corruptDataError(topic: string, partition: number, offset: bigint, caus
  */
 const RESPONSE_SLICE_MS = 2
 
+/**
+ * Longest run of decoding records, for a poll or ahead of one, before yielding to the event loop.
+ * Small snappy blocks decompress synchronously, so a consumer whose handlers settle without I/O
+ * would otherwise poll and decode its whole buffer, many polls' worth, in one loop turn.
+ */
+const DECODE_SLICE_MS = 2
+
 /** A partition whose buffered data failed to decode during a drain. */
 interface DrainFailure {
 	fetch: CompletedFetch
@@ -66,6 +73,8 @@ class FetchBuffer {
 	private capacityWaiter: (() => void) | null = null
 	private draining = false
 	private stageRun = 0
+	/** Shared by drains and stage(), and kept across polls, since consecutive polls can share a loop turn. */
+	private readonly decodeSlice = new LoopSlice(DECODE_SLICE_MS)
 
 	constructor(
 		readonly maxBytes: number,
@@ -117,6 +126,11 @@ class FetchBuffer {
 				let full = false
 				try {
 					for (;;) {
+						if (this.decodeSlice.expired) {
+							await this.decodeSlice.yield()
+							// Dropped by a pause, seek or revoke during the yield; its records are not delivered.
+							if (fetch.dropped) return takenBytes
+						}
 						const peeked = fetch.peek()
 						const record = peeked instanceof Promise ? await peeked : peeked
 						if (record === null) break
@@ -192,6 +206,10 @@ class FetchBuffer {
 			let takenBytes = 0
 			for (const fetch of byPartition.get(partitionKey)!) {
 				for (let index = 0; ;) {
+					if (this.decodeSlice.expired) {
+						await this.decodeSlice.yield()
+						if (run !== this.stageRun || fetch.dropped) return null
+					}
 					let record: DecodedRecord | null | Promise<void>
 					try {
 						record = fetch.ahead(index)

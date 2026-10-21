@@ -194,7 +194,7 @@ Consumers decompress and checksum record batches, and producers compress and che
 
 - The native `snappy` library is called synchronously for blocks of up to 64 KiB decoded (Java producers write 32 KiB blocks), where a libuv threadpool round trip would cost more than the decompression, and asynchronously for larger blocks.
 - The built-in gzip codec uses Node's async zlib above 8 KiB of input or 64 KiB of output. This keeps large batches off the event loop at the cost of a threadpool round trip per batch, so a consumer that is decode-bound on a single gzip partition delivers about 15-25% fewer records per second for 5-20% more total CPU.
-- A consumer checksums and copies each partition's record batches when a fetch response arrives, yielding to the event loop between partitions once that has run for 2 ms. It decompresses and parses records later, about one `maxBytesPerPartition` budget ahead of the poll that delivers them, and decompressing a Xerial-framed snappy batch yields after every 256 KiB of output.
+- A consumer checksums and copies each partition's record batches when a fetch response arrives, yielding to the event loop between partitions once that has run for 2 ms. It decompresses and parses records later, about one `maxBytesPerPartition` budget ahead of the poll that delivers them, yielding every 2 ms between records, and decompressing a Xerial-framed snappy batch yields after every 256 KiB of output.
 - A producer yields to the event loop every 2 ms while it encodes the batches of one send to the brokers.
 - Install [`@node-rs/crc32`](/guide/installation#native-crc32c-recommended) for native checksums.
 
