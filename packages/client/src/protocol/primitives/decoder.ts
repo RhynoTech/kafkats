@@ -1,6 +1,10 @@
 import type { IDecoder, TaggedField } from '@/protocol/primitives/types.js'
 import { zigZagDecode32, zigZagDecode64 } from '@/protocol/primitives/varint.js'
 
+const ONE_BYTE_VARLONGS: readonly bigint[] = Array.from({ length: 128 }, (_, byte) =>
+	BigInt(byte % 2 === 0 ? byte / 2 : -(byte + 1) / 2)
+)
+
 /**
  * Binary decoder for Kafka protocol messages
  * Reads sequentially from a buffer with position tracking
@@ -95,10 +99,30 @@ export class Decoder implements IDecoder {
 	}
 
 	readVarLong(): bigint {
-		let value = 0n
-		let shift = 0n
-		let byte: number
+		// Varlongs are mostly record timestamp deltas of a byte or two. One byte is a table lookup, and
+		// up to 7 bytes carry 49 bits, which a double holds exactly, so they skip the per-byte BigInts.
+		const first = this.buffer[this.position]
+		if (first !== undefined && first < 0x80) {
+			this.position++
+			return ONE_BYTE_VARLONGS[first]!
+		}
+		let small = 0
+		let scale = 1
+		for (let i = 0; i < 7; i++) {
+			if (this.position >= this.buffer.length) {
+				throw new Error('Buffer underflow while reading VARLONG')
+			}
+			const byte = this.buffer[this.position++]!
+			small += (byte & 0x7f) * scale
+			if ((byte & 0x80) === 0) {
+				return BigInt(small % 2 === 0 ? small / 2 : -(small + 1) / 2)
+			}
+			scale *= 128
+		}
 
+		let value = BigInt(small)
+		let shift = 49n
+		let byte: number
 		do {
 			if (this.position >= this.buffer.length) {
 				throw new Error('Buffer underflow while reading VARLONG')

@@ -114,6 +114,17 @@ describe('varint helpers', () => {
 			expect(new Decoder(encodeVarLong(v)).readVarLong()).toBe(v)
 		}
 	})
+
+	it('Decoder.readVarLong round-trips values around the 7-byte (49-bit) number fast path', () => {
+		const edges = [2n ** 47n, 2n ** 48n, 2n ** 49n, 2n ** 55n, 2n ** 56n]
+		const values = edges.flatMap(e => [e - 1n, e, e + 1n, -e - 1n, -e, -e + 1n])
+		values.push(63n, 64n, -64n, -65n, 8191n, 8192n, -8192n, -8193n, 1_792_559_112_263n)
+		for (const v of values) {
+			const decoder = new Decoder(Buffer.concat([encodeVarLong(v), Buffer.from([0x2a])]))
+			expect(decoder.readVarLong()).toBe(v)
+			expect(decoder.readInt8()).toBe(0x2a)
+		}
+	})
 })
 
 describe('32-bit zigzag boundary values (must stay unsigned, not overflow int32)', () => {

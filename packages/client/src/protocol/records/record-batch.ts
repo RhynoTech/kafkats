@@ -348,10 +348,10 @@ export function decodeRecordBatchFromSync(
 	// survivors carry non-sequential offsetDeltas and recordCount < lastOffsetDelta + 1; assuming
 	// sequential offsets there assigns wrong absolute offsets, so fall back to the real delta.
 	if (options.assumeSequentialOffsets && recordCount === lastOffsetDelta + 1) {
-		const verifyLength = options.verifyRecordLength !== false
+		const recordOptions = { verifyLength: options.verifyRecordLength !== false, logAppendTime }
 		let offset = baseOffset
 		for (let i = 0; i < recordCount; i++) {
-			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, { verifyLength, logAppendTime })
+			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, recordOptions)
 			offset += 1n
 		}
 	} else {
@@ -442,10 +442,10 @@ export async function decodeRecordBatchFrom(
 	// survivors carry non-sequential offsetDeltas and recordCount < lastOffsetDelta + 1; assuming
 	// sequential offsets there assigns wrong absolute offsets, so fall back to the real delta.
 	if (options.assumeSequentialOffsets && recordCount === lastOffsetDelta + 1) {
-		const verifyLength = options.verifyRecordLength !== false
+		const recordOptions = { verifyLength: options.verifyRecordLength !== false, logAppendTime }
 		let offset = baseOffset
 		for (let i = 0; i < recordCount; i++) {
-			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, { verifyLength, logAppendTime })
+			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, recordOptions)
 			offset += 1n
 		}
 	} else {

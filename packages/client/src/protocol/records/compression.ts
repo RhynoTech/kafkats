@@ -189,7 +189,15 @@ function snappyDecodedLength(block: Buffer): number {
 }
 
 function hasXerialHeader(data: Buffer): boolean {
-	return data.length >= XERIAL_HEADER_SIZE && data.subarray(0, XERIAL_MAGIC.length).equals(XERIAL_MAGIC)
+	if (data.length < XERIAL_HEADER_SIZE) {
+		return false
+	}
+	for (let i = 0; i < XERIAL_MAGIC.length; i++) {
+		if (data[i] !== XERIAL_MAGIC[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 type DecompressBlock = (block: Buffer) => Buffer | Promise<Buffer>
