@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { Producer } from '@/producer/producer.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
-import { ProducerFencedError } from '@/client/errors.js'
+import { ProducerFencedError, RecordTooLargeError } from '@/client/errors.js'
 import { createMockBroker, createMockCluster, buildProduceResponse } from './_helpers.js'
 
 describe('Producer retry behavior', () => {
@@ -163,7 +163,9 @@ describe('Producer retry behavior', () => {
 				])
 			)
 
-			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toThrow('MessageTooLarge')
+			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toThrow(
+				RecordTooLargeError
+			)
 			expect(mockBroker.produce).toHaveBeenCalledTimes(1)
 		})
 

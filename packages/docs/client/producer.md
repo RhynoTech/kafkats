@@ -57,6 +57,15 @@ This design makes `send()` fast under load, but it also means you should think a
 | Size-based batching | `maxBatchBytes`                              | Flush the current batch when it reaches the size threshold      |
 | Explicit flush      | `producer.flush()` / `producer.disconnect()` | Flush all batches immediately and wait for acknowledgments      |
 
+#### Large Sends
+
+All records one `send()` puts into a partition go into one record batch, and brokers reject a batch larger than the topic's `max.message.bytes` after compression (1 MiB by default). The producer keeps every batch within `maxRecordBatchBytes` (default 1,048,576) by cutting a partition's records into several batches, sent one after another in order. Inside a transaction every piece belongs to the same transaction. Outside a transaction the pieces are separate appends, so a failure can leave the earlier pieces written.
+
+- **Before encoding**, the producer estimates the compressed size from the compression ratio it has seen for the topic, so a large send is usually compressed once. The estimate starts out assuming no compression and improves slowly, as in the Java client, so the first large sends to a topic are cut into more batches than needed.
+- **After encoding**, a batch that came out larger than estimated is cut again before it is sent.
+- **If the broker still rejects a batch** as too large (a topic whose `max.message.bytes` is below `maxRecordBatchBytes`), the producer splits it in two, resends it without using a retry, and narrows down that topic's limit for later sends.
+- **A single record** that encodes larger than `maxRecordBatchBytes`, or than the topic is known to accept, fails with `RecordTooLargeError` without being sent. Raise `maxRecordBatchBytes` for topics whose `max.message.bytes` is larger.
+
 ::: tip Fire-and-forget
 You can call `producer.send(...)` without awaiting it, but you must eventually call `await producer.flush()` or `await producer.disconnect()` (or keep the process alive) to ensure queued records are actually delivered.
 :::
@@ -272,6 +281,7 @@ This is a quick reference for `client.producer({...})`. For the complete configu
 | `compression`          | `'none' \| 'gzip' \| 'snappy' \| 'lz4' \| 'zstd'`                             | `'none'`    | Applied to record batches                              |
 | `lingerMs`             | `number`                                                                      | `5`         | Time-based batching                                    |
 | `maxBatchBytes`        | `number`                                                                      | `16384`     | Size-based batching                                    |
+| `maxRecordBatchBytes`  | `number`                                                                      | `1048576`   | Largest encoded batch per partition (see Large Sends)  |
 | `retries`              | `number`                                                                      | `3`         | Retries on retriable errors                            |
 | `retryBackoffMs`       | `number`                                                                      | `100`       | Backoff start                                          |
 | `maxRetryBackoffMs`    | `number`                                                                      | `1000`      | Backoff cap                                            |

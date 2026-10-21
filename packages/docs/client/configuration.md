@@ -80,6 +80,7 @@ const producer = client.producer({
 | `compression`          | `'none' \| 'gzip' \| 'snappy' \| 'lz4' \| 'zstd'` | `'none'`    | Compression type                                                                                       |
 | `lingerMs`             | `number`                                          | `5`         | Batch wait time (ms)                                                                                   |
 | `maxBatchBytes`        | `number`                                          | `16384`     | Max batch size (bytes)                                                                                 |
+| `maxRecordBatchBytes`  | `number`                                          | `1048576`   | Largest encoded batch per partition; larger sends are split (bytes)                                    |
 | `retries`              | `number`                                          | `3`         | Retry attempts                                                                                         |
 | `retryBackoffMs`       | `number`                                          | `100`       | Initial retry backoff (ms)                                                                             |
 | `maxRetryBackoffMs`    | `number`                                          | `1000`      | Max retry backoff (ms)                                                                                 |
