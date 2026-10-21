@@ -9,6 +9,9 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		const broker = {
 			nodeId: 1,
 			fetch: vi.fn().mockResolvedValue({
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.None,
+				sessionId: 0,
 				topics: [
 					{
 						topic: 't',
@@ -58,6 +61,9 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		const broker = {
 			nodeId: 1,
 			fetch: vi.fn().mockResolvedValue({
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.None,
+				sessionId: 0,
 				topics: [
 					{
 						topic: 't',
@@ -126,6 +132,9 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		const broker = {
 			nodeId: 1,
 			fetch: vi.fn().mockResolvedValue({
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.None,
+				sessionId: 0,
 				topics: [
 					{
 						topic: 't',

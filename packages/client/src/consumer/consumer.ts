@@ -827,9 +827,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	private async cleanup(): Promise<void> {
-		if (this.fetchManager) {
-			this.fetchManager.stop()
-		}
+		const closingFetchSessions = this.fetchManager?.stop()
 
 		// Wait for fetch loop to exit before committing - ensures last message was marked consumed
 		const fetchLoopPromise = this.fetchLoopPromise
@@ -861,6 +859,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.emitError(error)
 			}
 		}
+
+		await closingFetchSessions
 
 		this.consumerGroup = null
 		this.offsetManager = null

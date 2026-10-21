@@ -19,12 +19,17 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
+import type { FetchRequestTopic, ForgottenTopic } from '@/protocol/messages/requests/fetch.js'
+import type { FetchResponse } from '@/protocol/messages/responses/fetch.js'
 import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
+import { FetchSessionHandler, type FetchSessionPartition } from './fetch-session.js'
+
+const NULL_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
 
 /**
  * True when the bytes at the decoder's position cannot hold the batch they declare: either the
@@ -62,6 +67,39 @@ function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): D
 /** Estimated in-memory size of a decoded record; drives buffer accounting and the per-partition batch cap. */
 function recordBytes(record: DecodedRecord): number {
 	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
+}
+
+function toRequestTopics(partitions: FetchSessionPartition[]): FetchRequestTopic[] {
+	const topics = new Map<string, FetchRequestTopic>()
+	for (const partition of partitions) {
+		let entry = topics.get(partition.topic)
+		if (!entry) {
+			entry = { topic: partition.topic, topicId: NULL_TOPIC_ID, partitions: [] }
+			topics.set(partition.topic, entry)
+		}
+		entry.partitions.push({
+			partitionIndex: partition.partition,
+			currentLeaderEpoch: -1,
+			fetchOffset: partition.fetchOffset,
+			lastFetchedEpoch: -1,
+			logStartOffset: -1n,
+			partitionMaxBytes: partition.maxBytes,
+		})
+	}
+	return Array.from(topics.values())
+}
+
+function toForgottenTopics(partitions: TopicPartition[]): ForgottenTopic[] {
+	const topics = new Map<string, ForgottenTopic>()
+	for (const { topic, partition } of partitions) {
+		let entry = topics.get(topic)
+		if (!entry) {
+			entry = { topic, topicId: NULL_TOPIC_ID, partitions: [] }
+			topics.set(topic, entry)
+		}
+		entry.partitions.push(partition)
+	}
+	return Array.from(topics.values())
 }
 
 /**
@@ -502,6 +540,9 @@ export class FetchManager {
 	// Buffered poll mode fields
 	private fetchBuffer: FetchBuffer | null = null
 	private brokerInFlight: Map<number, boolean> = new Map()
+	// One incremental fetch session per broker node. Requests to a node are sequential (one in flight),
+	// which the session epoch requires.
+	private readonly fetchSessions = new Map<number, { broker: Broker; handler: FetchSessionHandler }>()
 	// A fatal, non-retriable fetch error (e.g. CORRUPT_MESSAGE) surfaced to the next poll().
 	// The background fetch loop swallows rejected fetches (logs only), so fatal per-partition
 	// errors are stashed here and re-thrown from poll() rather than silently dropping data.
@@ -818,9 +859,10 @@ export class FetchManager {
 	}
 
 	/**
-	 * Stop the fetch loop
+	 * Stop the fetch loop. The returned promise settles once the brokers were asked to close their
+	 * fetch sessions; it never rejects.
 	 */
-	stop(): void {
+	stop(): Promise<void> {
 		this.logger.debug('stopping fetch manager')
 		this.running = false
 		// Abort global controller (for sleep in start loop)
@@ -835,6 +877,37 @@ export class FetchManager {
 			this.fetchBuffer = null
 		}
 		this.brokerInFlight.clear()
+		return this.closeFetchSessions()
+	}
+
+	// Without this the broker keeps each session until a new session needs its cache slot.
+	private async closeFetchSessions(): Promise<void> {
+		const closing: Array<Promise<void>> = []
+		for (const [brokerId, { broker, handler }] of this.fetchSessions) {
+			const sessionId = handler.close()
+			if (sessionId === 0) continue
+			closing.push(
+				broker.closeFetchSession(sessionId).catch((error: unknown) => {
+					this.logger.debug('failed to close fetch session', {
+						brokerId,
+						sessionId,
+						error: (error as Error).message,
+					})
+				})
+			)
+		}
+		this.fetchSessions.clear()
+		await Promise.all(closing)
+	}
+
+	private fetchSession(broker: Broker): FetchSessionHandler {
+		let session = this.fetchSessions.get(broker.nodeId)
+		if (!session) {
+			session = { broker, handler: new FetchSessionHandler() }
+			this.fetchSessions.set(broker.nodeId, session)
+		}
+		session.broker = broker
+		return session.handler
 	}
 
 	/**
@@ -1017,38 +1090,48 @@ export class FetchManager {
 		// Epoch captured at issue time; a seek during the fetch bumps state.fetchEpoch,
 		// so the stale response is dropped instead of clobbering the new position.
 		const issuedEpochByKey = new Map<string, number>()
-		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
+		const next: FetchSessionPartition[] = []
 		for (const state of partitions) {
-			if (!topicsMap.has(state.topic)) {
-				topicsMap.set(state.topic, [])
-			}
-			topicsMap.get(state.topic)!.push({ state })
 			const key = tpKey(state.topic, state.partition)
 			inflightStateByKey.set(key, state)
 			issuedEpochByKey.set(key, state.fetchEpoch)
+			next.push({
+				topic: state.topic,
+				partition: state.partition,
+				fetchOffset: state.offset,
+				maxBytes: this.config.maxBytesPerPartition,
+			})
 		}
 
-		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
-			topic,
-			topicId: '00000000-0000-0000-0000-000000000000',
-			partitions: parts.map(p => ({
-				partitionIndex: p.state.partition,
-				currentLeaderEpoch: -1,
-				fetchOffset: p.state.offset,
-				lastFetchedEpoch: -1,
-				logStartOffset: -1n,
-				partitionMaxBytes: this.config.maxBytesPerPartition,
-			})),
-		}))
+		const session = this.fetchSession(broker)
+		const request = session.build(next)
+		let response: FetchResponse
+		try {
+			response = await broker.fetch({
+				replicaId: -1,
+				maxWaitMs: this.config.maxWaitMs,
+				minBytes: this.config.minBytes,
+				maxBytes,
+				isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
+				sessionId: request.sessionId,
+				sessionEpoch: request.sessionEpoch,
+				topics: toRequestTopics(request.toSend),
+				forgottenTopicsData: toForgottenTopics(request.toForget),
+			})
+		} catch (error) {
+			session.handleError()
+			throw error
+		}
 
-		const response = await broker.fetch({
-			replicaId: -1,
-			maxWaitMs: this.config.maxWaitMs,
-			minBytes: this.config.minBytes,
-			maxBytes,
-			isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
-			topics,
-		})
+		if (!session.handleResponse(response)) {
+			this.logger.debug('fetch session reset', {
+				brokerId: broker.nodeId,
+				sessionId: request.sessionId,
+				sessionEpoch: request.sessionEpoch,
+				errorCode: response.errorCode,
+			})
+			return
+		}
 
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {

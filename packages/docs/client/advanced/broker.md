@@ -81,6 +81,10 @@ for (const topic of response.topics) {
 }
 ```
 
+Without `sessionId` and `sessionEpoch` the request is sessionless. To use a KIP-227 incremental fetch session, send
+`sessionEpoch: 0` to create one, follow the broker's `sessionId` with epochs 1, 2, ..., and close it with
+`broker.closeFetchSession(sessionId)`.
+
 ## Metadata API
 
 ```typescript

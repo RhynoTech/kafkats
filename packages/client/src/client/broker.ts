@@ -454,6 +454,30 @@ export class Broker {
 		return response
 	}
 
+	/**
+	 * Close a KIP-227 incremental fetch session. This goes on the control connection so it does not
+	 * queue behind a long-polling Fetch, and the broker answers at once because it names no partitions.
+	 */
+	async closeFetchSession(sessionId: number): Promise<void> {
+		const version = this.getApiVersion(ApiKey.Fetch)
+		this.logger.debug('closing fetch session', { sessionId })
+
+		const responseBuffer = await this.connection.send(ApiKey.Fetch, version, encoder => {
+			encodeFetchRequest(encoder, version, {
+				replicaId: -1,
+				maxWaitMs: 0,
+				minBytes: 0,
+				sessionId,
+				sessionEpoch: -1,
+				topics: [],
+			})
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.Fetch, version)
+		decodeFetchResponse(decoder, version)
+	}
+
 	async listOffsets(request: ListOffsetsRequest): Promise<ListOffsetsResponse> {
 		const version = this.getApiVersion(ApiKey.ListOffsets)
 		const startTime = Date.now()

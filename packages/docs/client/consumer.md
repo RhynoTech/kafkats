@@ -67,6 +67,11 @@ receives more than one partition's byte budget at once. A record larger than the
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 
+The consumer keeps an incremental fetch session (KIP-227) with each broker. After the first Fetch, a request names only
+the partitions whose position changed, and the broker serves the partitions that just returned records after the others,
+so a backlogged partition does not starve the partitions behind it. A broker whose session cache is full
+(`max.incremental.fetch.session.cache.slots`, default 1000) answers full fetches instead, in a fixed partition order.
+
 ### Async Iterator Mode (stream)
 
 Consume messages via `for await ... of`:
