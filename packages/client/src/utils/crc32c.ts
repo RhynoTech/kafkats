@@ -6,7 +6,7 @@
  * hardware acceleration on modern CPUs.
  *
  * This module uses native hardware-accelerated CRC32C via @node-rs/crc32
- * when available, with a fallback to a pure JS "slice-by-8" implementation.
+ * when available, with a fallback to a pure JS "slice-by-16" implementation.
  */
 
 import { createRequire } from 'node:module'
@@ -24,98 +24,94 @@ try {
 	// Optional native implementation not installed/available.
 }
 
+/** False when checksums run in JavaScript because @node-rs/crc32 is not installed. */
+export const hasNativeCrc32c = nativeCrc32c !== null
+
 // CRC32C polynomial (Castagnoli): 0x1EDC6F41
 // Reversed/reflected polynomial for table generation: 0x82F63B78
 const CRC32C_POLYNOMIAL = 0x82f63b78
 
 /**
- * Pre-computed lookup tables for slice-by-8 CRC32C calculation
- * 8 tables of 256 entries each, allowing 8-byte-at-a-time processing
+ * Slice-by-16 lookup tables in one array, table k at [256 * k, 256 * k + 256): 16 bytes per step.
+ * One typed-array base keeps the hot loop free of per-table loads.
  */
-const CRC32C_TABLES: Uint32Array[] = generateCrc32cTables()
+const CRC32C_TABLE: Int32Array = generateCrc32cTable()
 
-function generateCrc32cTables(): Uint32Array[] {
-	const tables: Uint32Array[] = []
+function generateCrc32cTable(): Int32Array {
+	const table = new Int32Array(16 * 256)
 
-	// Generate base table (table 0)
-	const table0 = new Uint32Array(256)
 	for (let i = 0; i < 256; i++) {
 		let crc = i
 		for (let j = 0; j < 8; j++) {
-			if (crc & 1) {
-				crc = (crc >>> 1) ^ CRC32C_POLYNOMIAL
-			} else {
-				crc = crc >>> 1
-			}
+			crc = crc & 1 ? (crc >>> 1) ^ CRC32C_POLYNOMIAL : crc >>> 1
 		}
-		table0[i] = crc
+		table[i] = crc
 	}
-	tables.push(table0)
 
-	// Generate tables 1-7 by extending table 0
-	for (let t = 1; t < 8; t++) {
-		const table = new Uint32Array(256)
+	// Table k advances table k - 1 by one more zero byte
+	for (let k = 1; k < 16; k++) {
 		for (let i = 0; i < 256; i++) {
-			table[i] = (tables[t - 1]![i]! >>> 8) ^ table0[tables[t - 1]![i]! & 0xff]!
+			const previous = table[(k - 1) * 256 + i]!
+			table[k * 256 + i] = (previous >>> 8) ^ table[previous & 0xff]!
 		}
-		tables.push(table)
 	}
 
-	return tables
+	return table
 }
 
-// Extract tables for faster access (avoid array indexing in hot loop)
-const T0 = CRC32C_TABLES[0]!
-const T1 = CRC32C_TABLES[1]!
-const T2 = CRC32C_TABLES[2]!
-const T3 = CRC32C_TABLES[3]!
-const T4 = CRC32C_TABLES[4]!
-const T5 = CRC32C_TABLES[5]!
-const T6 = CRC32C_TABLES[6]!
-const T7 = CRC32C_TABLES[7]!
+// Below this a DataView costs more to create than the 16-byte steps save
+const SLICE_BY_16_MIN_BYTES = 64
 
 /**
- * Calculate CRC32C checksum using pure JS slice-by-8 algorithm.
+ * Calculate CRC32C checksum using pure JS slice-by-16.
+ *
+ * Reads 32-bit little-endian words through a DataView, which handles any byte offset and host
+ * byte order; an Int32Array view needs 4-byte alignment and little-endian hardware.
  */
-function crc32cJS(data: Buffer, start: number, end: number): number {
-	let crc = 0xffffffff
+export function crc32cJS(data: Uint8Array, start: number, end: number): number {
+	const T = CRC32C_TABLE
+	let crc = -1
 	let i = start
 
-	// Process 8 bytes at a time using slice-by-8
-	const endMain = start + ((end - start) & ~7) // Round down to multiple of 8
-	while (i < endMain) {
-		// XOR CRC with first 4 bytes
-		const lo = (data[i]! | (data[i + 1]! << 8) | (data[i + 2]! << 16) | (data[i + 3]! << 24)) ^ crc
-		const hi = data[i + 4]! | (data[i + 5]! << 8) | (data[i + 6]! << 16) | (data[i + 7]! << 24)
-
-		crc =
-			T7[lo & 0xff]! ^
-			T6[(lo >>> 8) & 0xff]! ^
-			T5[(lo >>> 16) & 0xff]! ^
-			T4[(lo >>> 24) & 0xff]! ^
-			T3[hi & 0xff]! ^
-			T2[(hi >>> 8) & 0xff]! ^
-			T1[(hi >>> 16) & 0xff]! ^
-			T0[(hi >>> 24) & 0xff]!
-
-		i += 8
+	if (end - start >= SLICE_BY_16_MIN_BYTES) {
+		const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+		for (const last = end - 16; i <= last; i += 16) {
+			const a = view.getInt32(i, true) ^ crc
+			const b = view.getInt32(i + 4, true)
+			const c = view.getInt32(i + 8, true)
+			const d = view.getInt32(i + 12, true)
+			crc =
+				T[3840 + (a & 0xff)]! ^
+				T[3584 + ((a >>> 8) & 0xff)]! ^
+				T[3328 + ((a >>> 16) & 0xff)]! ^
+				T[3072 + (a >>> 24)]! ^
+				T[2816 + (b & 0xff)]! ^
+				T[2560 + ((b >>> 8) & 0xff)]! ^
+				T[2304 + ((b >>> 16) & 0xff)]! ^
+				T[2048 + (b >>> 24)]! ^
+				T[1792 + (c & 0xff)]! ^
+				T[1536 + ((c >>> 8) & 0xff)]! ^
+				T[1280 + ((c >>> 16) & 0xff)]! ^
+				T[1024 + (c >>> 24)]! ^
+				T[768 + (d & 0xff)]! ^
+				T[512 + ((d >>> 8) & 0xff)]! ^
+				T[256 + ((d >>> 16) & 0xff)]! ^
+				T[d >>> 24]!
+		}
 	}
 
-	// Process remaining bytes one at a time
 	while (i < end) {
-		crc = T0[(crc ^ data[i]!) & 0xff]! ^ (crc >>> 8)
-		i++
+		crc = T[(crc ^ data[i++]!) & 0xff]! ^ (crc >>> 8)
 	}
 
-	// Final XOR and ensure unsigned
-	return (crc ^ 0xffffffff) >>> 0
+	return (crc ^ -1) >>> 0
 }
 
 /**
  * Calculate CRC32C checksum of a buffer.
  *
  * Uses native hardware-accelerated CRC32C when available, falling back to the
- * pure JS slice-by-8 implementation otherwise.
+ * pure JS slice-by-16 implementation otherwise.
  *
  * @param data - The buffer to calculate checksum for
  * @param start - Optional start offset (default: 0)
