@@ -54,6 +54,20 @@ export interface ProducerConfig {
 	lingerMs?: number
 	/** Flush when batch reaches N bytes (default: 16384) */
 	maxBatchBytes?: number
+	/**
+	 * Largest record batch sent to one partition, in encoded (compressed) bytes (default: 1048576)
+	 *
+	 * Brokers reject a batch larger than the topic's `max.message.bytes` (1048588 by default, which
+	 * includes 12 bytes of log overhead). One `send()` puts all of its records for a partition into
+	 * one batch, so the producer cuts a larger batch into several, sent one after another in order;
+	 * inside a transaction every piece belongs to the same transaction. A single record that encodes
+	 * larger than this fails with `RecordTooLargeError` without being sent.
+	 *
+	 * Raise it for topics whose `max.message.bytes` is larger. A topic with a lower limit needs no
+	 * setting: the producer splits the batch the broker rejects and remembers that topic's limit for
+	 * five minutes after the last rejection.
+	 */
+	maxRecordBatchBytes?: number
 	/** Required acknowledgments (default: 'all') */
 	acks?: Acks
 	/** Number of retries on retriable errors (default: 3) */
@@ -131,6 +145,7 @@ export interface ProducerConfig {
 export interface ResolvedProducerConfig {
 	lingerMs: number
 	maxBatchBytes: number
+	maxRecordBatchBytes: number
 	acks: number // Resolved to -1, 1, or 0
 	retries: number
 	retryBackoffMs: number
@@ -146,16 +161,28 @@ export interface ResolvedProducerConfig {
 	maxBlockMs: number
 }
 
-export type ProducerTraceStage = 'encode_batch' | 'produce_request'
+export type ProducerTraceStage = 'encode_batch' | 'produce_request' | 'batch_split'
+
+/**
+ * Why a partition's batch was cut: its estimated size was over the limit ('estimate'), its encoded
+ * size was ('encoded_size'), or the broker rejected it as too large ('broker_rejected').
+ */
+export type BatchSplitReason = 'estimate' | 'encoded_size' | 'broker_rejected'
 
 export interface ProducerTraceEvent {
 	stage: ProducerTraceStage
 	durationMs: number
 	recordCount?: number
 	bytes?: number
+	/** encode_batch only: the size the compression ratio estimate predicted before encoding */
+	estimatedBytes?: number
 	brokerId?: number
 	topic?: string
 	partition?: number
+	/** batch_split only: number of batches the records were cut into */
+	pieces?: number
+	/** batch_split only */
+	reason?: BatchSplitReason
 }
 
 export type ProducerTraceFn = (event: ProducerTraceEvent) => void

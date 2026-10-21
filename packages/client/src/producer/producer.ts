@@ -14,9 +14,11 @@ import {
 	InvalidTxnStateError,
 	TransactionAbortedError,
 	KafkaProtocolError,
+	RecordTooLargeError,
 } from '@/client/errors.js'
 import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/protocol/records/record-batch.js'
 import { CompressionType } from '@/protocol/records/compression.js'
+import { varIntSize } from '@/protocol/primitives/varint.js'
 import { ReconnectionStrategy } from '@/network/reconnection.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { LoopSlice } from '@/utils/loop-slice.js'
@@ -24,6 +26,11 @@ import { sleep as sleepMs } from '@/utils/sleep.js'
 import { createRetryStrategyOptions, retry, type RetryOptions } from '@/utils/retry.js'
 import type { ConsumeContext } from '@/consumer/types.js'
 import { RecordAccumulator } from './accumulator.js'
+import {
+	CompressionRatioEstimator,
+	RECORD_BATCH_HEADER_BYTES,
+	recordBytesWithin,
+} from './compression-ratio-estimator.js'
 import { murmur2Partitioner } from './partitioners/murmur2.js'
 import { createRoundRobinPartitioner } from './partitioners/round-robin.js'
 import type {
@@ -48,9 +55,79 @@ import type {
 	ProducerTransaction,
 	GroupMetadata,
 	ProducerTraceFn,
+	BatchSplitReason,
 } from './types.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
+
+// Once a topic's known limit is within 2% of the smallest batch it rejected, stop probing above it.
+const TOPIC_LIMIT_SEARCH_PRECISION = 0.02
+// Producers are not told when max.message.bytes is raised, and batches cut to a learned limit never
+// show a higher one, so the limit is learned again from the broker this long after its last rejection.
+const TOPIC_LIMIT_TTL_MS = 5 * 60 * 1000
+
+type TopicBatchLimit = { fits: number; rejected: number; rejectedAt: number }
+
+// The compression ratio estimate only decides how batches near the limit are cut, and much smaller
+// batches compress worse (single records worst): learning from them would cut large sends into
+// more pieces than they need.
+const MIN_OBSERVED_BATCH_FRACTION = 1 / 16
+
+/** Upper bound on a record's size inside an encoded batch: its two deltas count at their widest varints. */
+function recordSizeUpperBound(message: QueuedMessage): number {
+	// attributes, timestampDelta (varlong), offsetDelta (varint), key, value, header count
+	let body = 1 + 10 + 5 + sizeOfBytes(message.key) + sizeOfBytes(message.value)
+	let headerCount = 0
+	for (const key in message.headers) {
+		const keyBytes = Buffer.byteLength(key)
+		body += varIntSize(keyBytes) + keyBytes + sizeOfBytes(message.headers[key]!)
+		headerCount++
+	}
+	body += varIntSize(headerCount)
+	return varIntSize(body) + body
+}
+
+function sizeOfBytes(bytes: Buffer | null): number {
+	return bytes === null ? 1 : varIntSize(bytes.length) + bytes.length
+}
+
+function sum(values: number[]): number {
+	let total = 0
+	for (const value of values) {
+		total += value
+	}
+	return total
+}
+
+/**
+ * Lengths of consecutive runs of `sizes`, in order, each within `budget` bytes unless one record is
+ * larger. Runs are evened out so the last is not a small leftover: no more runs than filling each
+ * to the budget, but more room under the budget for every run when the sizes are estimates.
+ */
+function pieceLengths(sizes: number[], budget: number): number[] {
+	let total = 0
+	let largest = 0
+	for (const size of sizes) {
+		total += size
+		largest = Math.max(largest, size)
+	}
+	const runs = Math.ceil(total / budget)
+	// Filling each run to its even share plus one record leaves at most `runs` runs.
+	const fill = runs > 1 ? Math.min(budget, total / runs + largest) : budget
+	const lengths: number[] = []
+	let start = 0
+	let bytes = 0
+	for (let i = 0; i < sizes.length; i++) {
+		if (i > start && bytes + sizes[i]! > fill) {
+			lengths.push(i - start)
+			start = i
+			bytes = 0
+		}
+		bytes += sizes[i]!
+	}
+	lengths.push(sizes.length - start)
+	return lengths
+}
 
 // Producers whose transaction callback is running in the current async context.
 // Detects producer.transaction() called from inside that same producer's own
@@ -120,6 +197,7 @@ const ENCODE_SLICE_MS = 2
 const DEFAULT_CONFIG: Required<Omit<ProducerConfig, 'transactionalId' | 'trace'>> = {
 	lingerMs: 5,
 	maxBatchBytes: 16384,
+	maxRecordBatchBytes: 1_048_576,
 	acks: 'all',
 	retries: 3,
 	retryBackoffMs: 100,
@@ -195,6 +273,18 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private inflightCount = 0
 
+	// Shared with transaction lanes, so every lane benefits from what one of them learns.
+	private compressionRatios = new CompressionRatioEstimator()
+	// Topics whose max.message.bytes is below maxRecordBatchBytes: the largest batch the broker
+	// accepted and the smallest it rejected as too large bound the topic's limit.
+	private topicBatchLimits = new Map<string, TopicBatchLimit>()
+	// Pieces already cut to size. Like a closed batch in the Java client they are not cut again by
+	// estimate, which may have grown since, only by their exact encoded size.
+	private readonly cutBatches = new WeakSet<PartitionBatch>()
+	// The pieces of a batch share the first failure of any of them. Outside a transaction, sending the
+	// pieces queued behind a failed one would write records after one the caller was told failed.
+	private readonly pieceFailures = new WeakMap<PartitionBatch, { error: Error | null }>()
+
 	// Broker-level batching: collect ready batches and group by broker
 	private pendingBatches: PartitionBatch[] = []
 	private drainScheduled = false
@@ -251,6 +341,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					transactionConcurrency: 1,
 				})
 				lane.on('error', error => this.emit('error', error))
+				lane.compressionRatios = this.compressionRatios
+				lane.topicBatchLimits = this.topicBatchLimits
 				lanes.push(lane)
 			}
 			this.lanes = lanes
@@ -345,10 +437,35 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private async prepareProduceBatches(batches: PartitionBatch[]): Promise<PreparedProduceBatch[]> {
 		const preparedBatches: PreparedProduceBatch[] = []
+		const { compression } = this.config
 		const slice = new LoopSlice(ENCODE_SLICE_MS)
 		for (const batch of batches) {
 			if (slice.expired) await slice.yield()
-			const { topic, partition, messages } = batch
+			const earlierFailure = this.transactionAbortCause ?? this.pieceFailures.get(batch)?.error
+			if (earlierFailure) {
+				// Records queued behind a failed record would only add data the abort discards, or be
+				// written after it outside a transaction.
+				for (const msg of batch.messages) {
+					msg.reject(earlierFailure)
+				}
+				continue
+			}
+
+			const { topic, partition } = batch
+			const limit = this.recordBatchLimit(topic)
+			let messages = batch.messages
+			let sizes = messages.map(recordSizeUpperBound)
+			if (
+				!this.cutBatches.has(batch) &&
+				messages.length > 1 &&
+				this.compressionRatios.estimateBatchBytes(topic, compression, sum(sizes)) > limit
+			) {
+				// Cut before encoding, so a batch expected to be too large is not compressed only to be discarded.
+				const budget = this.compressionRatios.recordBytesWithin(topic, compression, limit)
+				const kept = this.keepFirstPiece(batch, messages, sizes, budget, 'estimate')
+				messages = messages.slice(0, kept)
+				sizes = sizes.slice(0, kept)
+			}
 			let recordCount = messages.length
 			let messagesToSend = messages
 
@@ -360,28 +477,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				// Handle sequence wrap - only use reserved count
 				if (reservation.reservedCount < recordCount) {
 					messagesToSend = messages.slice(0, reservation.reservedCount)
-					// Re-queue remaining messages
-					const remainingBatch: PartitionBatch = {
-						topic,
-						partition,
-						messages: messages.slice(reservation.reservedCount),
-						sizeBytes: messages
-							.slice(reservation.reservedCount)
-							.reduce((sum, m) => sum + (m.value?.length ?? 0) + (m.key?.length ?? 0), 0),
-						createdAt: Date.now(),
-					}
-					// Prepend, not push: this remainder holds the messages that immediately
-					// follow the ones being sent now. It must drain before any later batch
-					// already queued for this partition, or per-partition order would break
-					// (the later batch would get a lower sequence than the remainder).
-					this.pendingBatches.unshift(remainingBatch)
-					// The remainder never went through flushBatch(), but its send will call
-					// batchCompleted() — account for it or the pending counter goes negative.
-					this.accumulator.batchEnqueued()
-					this.scheduleDrain()
+					sizes = sizes.slice(0, reservation.reservedCount)
+					this.requeueFront(batch, [messages.slice(reservation.reservedCount)])
 					recordCount = reservation.reservedCount
 				}
 			}
+			const recordBytes = sum(sizes)
 
 			const batchId = Symbol('batch')
 			if (this.config.idempotent) {
@@ -399,6 +500,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				}
 			}
 
+			const estimatedBytes = this.compressionRatios.estimateBatchBytes(topic, compression, recordBytes)
 			const encodeStart = performance.now()
 			const recordBatch = createRecordBatch(
 				messagesToSend,
@@ -411,15 +513,23 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 			try {
 				const encodeOptions = {
-					compression: this.config.compression,
+					compression,
 					isTransactional: this.config.transactionalId !== null,
 				}
 
 				// Use synchronous encoding when compression is disabled (faster)
 				const encodedBatch =
-					this.config.compression === CompressionType.None
+					compression === CompressionType.None
 						? encodeRecordBatchSync(recordBatch, encodeOptions)
 						: await encodeRecordBatch(recordBatch, encodeOptions)
+				if (this.config.idempotent && !this.inflightBatches.has(batchId)) {
+					// A fence or disconnect during compression already rejected these records; sending
+					// them, or pieces of them, under the next epoch would write records reported failed.
+					continue
+				}
+				if (recordBytes >= limit * MIN_OBSERVED_BATCH_FRACTION) {
+					this.compressionRatios.observe(topic, compression, recordBytes, encodedBatch.length)
+				}
 
 				const encodeEnd = performance.now()
 				if (this.trace) {
@@ -428,9 +538,37 @@ export class Producer extends EventEmitter<ProducerEvents> {
 						durationMs: encodeEnd - encodeStart,
 						recordCount,
 						bytes: encodedBatch.length,
+						estimatedBytes,
 						topic,
 						partition,
 					})
+				}
+
+				// A learned topic limit only cuts batches: the topic may accept a larger record by now, and
+				// only the broker can tell.
+				const sizeLimit = recordCount === 1 ? this.config.maxRecordBatchBytes : limit
+				if (encodedBatch.length > sizeLimit) {
+					// Nothing was sent, so the pieces reuse this batch's sequence range in order.
+					if (this.config.idempotent) {
+						this.rollbackSequence(topic, partition, recordCount)
+						this.inflightBatches.delete(batchId)
+					}
+					if (recordCount === 1) {
+						const error = new RecordTooLargeError(topic, partition, encodedBatch.length, sizeLimit)
+						this.recordBatchFailure(batch, error)
+						messagesToSend[0]!.reject(error)
+						continue
+					}
+					// Cut by the ratio these records just showed. That budget is below their total, so the cut
+					// always leaves at least two pieces.
+					const observedRatio = (encodedBatch.length - RECORD_BATCH_HEADER_BYTES) / recordBytes
+					const budget = recordBytesWithin(limit, compression, observedRatio)
+					const kept = this.keepFirstPiece(batch, messagesToSend, sizes, budget, 'encoded_size')
+					const head = { ...batch, messages: messagesToSend.slice(0, kept) }
+					this.cutBatches.add(head)
+					this.pieceFailures.set(head, this.pieceFailure(batch))
+					preparedBatches.push(...(await this.prepareProduceBatches([head])))
+					continue
 				}
 
 				preparedBatches.push({
@@ -450,12 +588,168 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					this.rollbackSequence(topic, partition, recordCount)
 					this.inflightBatches.delete(batchId)
 				}
+				const failure = error instanceof Error ? error : new Error(String(error))
+				this.recordBatchFailure(batch, failure)
 				for (const msg of messagesToSend) {
-					msg.reject(error instanceof Error ? error : new Error(String(error)))
+					msg.reject(failure)
 				}
 			}
 		}
 		return preparedBatches
+	}
+
+	/** The size multi-record batches are cut to fit. */
+	private recordBatchLimit(topic: string): number {
+		const known = this.learnedTopicLimit(topic)
+		if (!known) {
+			return this.config.maxRecordBatchBytes
+		}
+		// Cutting just under the last rejected size would be rejected again and again by a few bytes,
+		// so search halfway between the two bounds until they are close, then keep to what fit. The
+		// midpoint counts the batch header once per half, so the halves of a rejected batch fit it.
+		if (known.rejected - known.fits <= known.rejected * TOPIC_LIMIT_SEARCH_PRECISION) {
+			return known.fits
+		}
+		return Math.floor((known.fits + known.rejected + RECORD_BATCH_HEADER_BYTES) / 2)
+	}
+
+	private learnedTopicLimit(topic: string): TopicBatchLimit | undefined {
+		const known = this.topicBatchLimits.get(topic)
+		if (known && Date.now() - known.rejectedAt > TOPIC_LIMIT_TTL_MS) {
+			this.topicBatchLimits.delete(topic)
+			return undefined
+		}
+		return known
+	}
+
+	/**
+	 * Cut `messages` into runs within `budget` record bytes, keep the first and queue the rest ahead
+	 * of everything else. Returns how many records were kept.
+	 */
+	private keepFirstPiece(
+		batch: PartitionBatch,
+		messages: QueuedMessage[],
+		sizes: number[],
+		budget: number,
+		reason: 'estimate' | 'encoded_size'
+	): number {
+		const lengths = pieceLengths(sizes, budget)
+		const pieces: QueuedMessage[][] = []
+		let start = lengths[0]!
+		for (let i = 1; i < lengths.length; i++) {
+			pieces.push(messages.slice(start, start + lengths[i]!))
+			start += lengths[i]!
+		}
+		this.requeueFront(batch, pieces)
+		this.traceSplit(batch, messages.length, lengths.length, reason)
+		return lengths[0]!
+	}
+
+	/**
+	 * The broker rejected a batch as too large, so the topic's max.message.bytes (or segment size)
+	 * is below maxRecordBatchBytes: narrow down the topic's limit and resend the records in halves.
+	 * The broker rejects before appending or advancing producer state, so the halves reuse the
+	 * rejected batch's sequence range, and a split costs none of the retry budget (Java parity).
+	 */
+	private splitRejectedBatch(prepared: PreparedProduceBatch): void {
+		if (this.config.idempotent && !this.inflightBatches.has(prepared.batchId)) {
+			// A fence while this batch was in flight already rejected its records, and the epoch may not
+			// have changed yet: resending them would write records reported failed.
+			return
+		}
+		const { batch, encodedBatch, messagesToSend } = prepared
+		const known = this.learnedTopicLimit(batch.topic) ?? {
+			fits: 0,
+			rejected: Number.POSITIVE_INFINITY,
+			rejectedAt: 0,
+		}
+		known.rejected = Math.min(known.rejected, encodedBatch.length)
+		known.rejectedAt = Date.now()
+		if (known.fits >= known.rejected) {
+			// The topic's limit was lowered since that batch fit.
+			known.fits = 0
+		}
+		this.topicBatchLimits.set(batch.topic, known)
+		const sizes = messagesToSend.map(recordSizeUpperBound)
+		this.compressionRatios.reset(
+			batch.topic,
+			this.config.compression,
+			(encodedBatch.length - RECORD_BATCH_HEADER_BYTES) / sum(sizes)
+		)
+		if (messagesToSend.length === 1) {
+			this.failPreparedBatch(
+				prepared,
+				new RecordTooLargeError(batch.topic, batch.partition, encodedBatch.length, known.rejected - 1)
+			)
+			return
+		}
+
+		if (this.config.idempotent) {
+			this.rollbackSequence(batch.topic, batch.partition, prepared.recordCount)
+			this.inflightBatches.delete(prepared.batchId)
+		}
+		const cut = pieceLengths(sizes, sum(sizes) / 2)[0]!
+		this.logger.warn('broker rejected record batch as too large, splitting', {
+			topic: batch.topic,
+			partition: batch.partition,
+			bytes: encodedBatch.length,
+			recordCount: messagesToSend.length,
+			nextLimit: this.recordBatchLimit(batch.topic),
+		})
+		this.requeueFront(batch, [messagesToSend.slice(0, cut), messagesToSend.slice(cut)])
+		this.traceSplit(batch, messagesToSend.length, 2, 'broker_rejected')
+	}
+
+	private traceSplit(batch: PartitionBatch, recordCount: number, pieces: number, reason: BatchSplitReason): void {
+		this.trace?.({
+			stage: 'batch_split',
+			durationMs: 0,
+			recordCount,
+			topic: batch.topic,
+			partition: batch.partition,
+			pieces,
+			reason,
+		})
+	}
+
+	/**
+	 * Queue the records that immediately follow the batch being prepared, ahead of every later
+	 * batch already queued for the partition: draining a later one first would give it a lower
+	 * sequence and break per-partition order.
+	 */
+	private requeueFront(batch: PartitionBatch, pieces: QueuedMessage[][]): void {
+		const { topic, partition } = batch
+		const failure = this.pieceFailure(batch)
+		for (let i = pieces.length - 1; i >= 0; i--) {
+			const piece = { topic, partition, messages: pieces[i]!, sizeBytes: 0, createdAt: Date.now() }
+			this.cutBatches.add(piece)
+			this.pieceFailures.set(piece, failure)
+			this.pendingBatches.unshift(piece)
+			// The piece never went through flushBatch(), but its send will call batchCompleted().
+			this.accumulator.batchEnqueued()
+		}
+		this.scheduleDrain()
+	}
+
+	private pieceFailure(batch: PartitionBatch): { error: Error | null } {
+		let failure = this.pieceFailures.get(batch)
+		if (!failure) {
+			failure = { error: null }
+			this.pieceFailures.set(batch, failure)
+		}
+		return failure
+	}
+
+	/**
+	 * Recorded when the records fail, not when their send's promise rejects, so pieces of the same
+	 * batch already queued see the failure, or the doomed transaction, before they are sent.
+	 */
+	private recordBatchFailure(batch: PartitionBatch, error: Error): void {
+		this.recordTransactionalSendFailure(error)
+		const failure = this.pieceFailures.get(batch)
+		if (failure) {
+			failure.error ??= error
+		}
 	}
 
 	private async sendPreparedBatches(preparedBatches: PreparedProduceBatch[]): Promise<void> {
@@ -632,6 +926,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 						return { retryBatches: [], stop: true }
 					}
 
+					if (errorCode === ErrorCode.MessageTooLarge || errorCode === ErrorCode.RecordListTooLarge) {
+						this.splitRejectedBatch(prepared)
+						continue
+					}
+
 					if (isRetriableError(errorCode)) {
 						retryBatches.push(prepared)
 						if (shouldRefreshMetadata(errorCode)) {
@@ -742,6 +1041,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private failPreparedBatch(prepared: PreparedProduceBatch, error: Error): void {
 		const { batch, recordCount, batchId, messagesToSend } = prepared
+		this.recordBatchFailure(batch, error)
 		if (this.config.idempotent) {
 			// Safe to roll back: this path is only for definitive failures (explicit broker
 			// error code, or a pre-send encoding failure) where the sequence was not consumed.
@@ -759,13 +1059,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private handleBatchSuccess(
 		prepared: {
 			batch: PartitionBatch
+			encodedBatch: Buffer
 			recordCount: number
 			batchId: symbol
 			messagesToSend: QueuedMessage[]
 		},
 		partitionResponse: { baseOffset: bigint; logAppendTimeMs: bigint }
 	): void {
-		const { batch, recordCount, batchId, messagesToSend } = prepared
+		const { batch, encodedBatch, recordCount, batchId, messagesToSend } = prepared
 		const baseOffset = partitionResponse.baseOffset
 		// logAppendTimeMs is -1 for CreateTime topics — fall back to the timestamp
 		// encoded into each record (Java parity).
@@ -784,6 +1085,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		if (this.config.idempotent) {
 			this.commitSequence(batch.topic, batch.partition, recordCount)
 			this.inflightBatches.delete(batchId)
+		}
+
+		const known = this.topicBatchLimits.get(batch.topic)
+		if (known && encodedBatch.length >= known.rejected) {
+			// The topic's limit was raised since that rejection.
+			this.topicBatchLimits.delete(batch.topic)
+		} else if (known) {
+			known.fits = Math.max(known.fits, encodedBatch.length)
 		}
 
 		this.rotateStickyPartition(batch.topic)
@@ -1754,10 +2063,17 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		const abortError = new TransactionAbortedError(this.config.transactionalId!)
 		this.accumulator.clearWithRejection(abortError)
+		this.rejectAndClearPendingBatches(abortError)
 
 		// Drain in-flight sends before EndTxn(abort): a transactional ProduceRequest must
 		// not race the abort marker. Failures are expected — the sends are being aborted.
 		await Promise.allSettled(this.activeSends)
+		// A send settles on its first failed record while its other batches may still be in flight
+		// or queueing pieces, and either would otherwise reach a broker after the abort marker.
+		while (this.inflight.size > 0 || this.pendingBatches.length > 0) {
+			this.rejectAndClearPendingBatches(abortError)
+			await Promise.allSettled(this.inflight)
+		}
 
 		try {
 			// Nothing was added to the transaction: it never started broker-side, and
@@ -2271,6 +2587,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			}
 		}
 
+		const maxRecordBatchBytes = config.maxRecordBatchBytes ?? DEFAULT_CONFIG.maxRecordBatchBytes
+		if (!Number.isInteger(maxRecordBatchBytes) || maxRecordBatchBytes <= RECORD_BATCH_HEADER_BYTES) {
+			throw new Error(`maxRecordBatchBytes must be an integer > ${RECORD_BATCH_HEADER_BYTES}`)
+		}
+
 		const acks = this.resolveAcks(config.acks ?? DEFAULT_CONFIG.acks)
 		const compression = this.resolveCompression(config.compression ?? DEFAULT_CONFIG.compression)
 		const partitioner = this.resolvePartitioner(config.partitioner ?? DEFAULT_CONFIG.partitioner)
@@ -2282,6 +2603,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		return {
 			lingerMs: config.lingerMs ?? DEFAULT_CONFIG.lingerMs,
 			maxBatchBytes: config.maxBatchBytes ?? DEFAULT_CONFIG.maxBatchBytes,
+			maxRecordBatchBytes,
 			acks,
 			retries: idempotent ? Math.max(retries, 1) : retries,
 			retryBackoffMs: config.retryBackoffMs ?? DEFAULT_CONFIG.retryBackoffMs,

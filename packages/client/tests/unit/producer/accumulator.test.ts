@@ -8,6 +8,7 @@ function createConfig(overrides: Partial<ResolvedProducerConfig> = {}): Resolved
 	return {
 		lingerMs: 5,
 		maxBatchBytes: 16384,
+		maxRecordBatchBytes: 1_048_576,
 		acks: -1,
 		retries: 3,
 		retryBackoffMs: 100,
