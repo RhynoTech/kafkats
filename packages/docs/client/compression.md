@@ -188,6 +188,15 @@ Choose your compression strategy based on your use case:
 | Balanced workload        | Snappy       | Good mix of speed and compression |
 | Log/text data            | Gzip or Zstd | Text compresses well with these   |
 
+### Event-loop cost
+
+Consumers decompress and checksum record batches on the event loop, so this work competes with your handlers and timers. kafkats keeps it short:
+
+- The native `snappy` library is called synchronously for blocks of up to 64 KiB decoded (Java producers write 32 KiB blocks), where a libuv threadpool round trip would cost more than the decompression, and asynchronously for larger blocks.
+- The built-in gzip codec uses Node's async zlib above 8 KiB of input or 64 KiB of output.
+- Decoding a fetch response yields to the event loop every 2 ms.
+- Install [`@node-rs/crc32`](/guide/installation#native-crc32c-recommended) for native checksums.
+
 ## Supported Libraries Summary
 
 ### Snappy
