@@ -190,11 +190,12 @@ Choose your compression strategy based on your use case:
 
 ### Event-loop cost
 
-Consumers decompress and checksum record batches on the event loop, so this work competes with your handlers and timers. kafkats keeps it short:
+Consumers decompress and checksum record batches, and producers compress and checksum them, on the event loop, so this work competes with your handlers and timers. kafkats keeps it short:
 
 - The native `snappy` library is called synchronously for blocks of up to 64 KiB decoded (Java producers write 32 KiB blocks), where a libuv threadpool round trip would cost more than the decompression, and asynchronously for larger blocks.
 - The built-in gzip codec uses Node's async zlib above 8 KiB of input or 64 KiB of output.
 - Decoding a fetch response yields to the event loop between record batches once it has run for 2 ms, and within a Xerial-framed snappy batch after every 256 KiB of decompressed output. The records of one batch are decoded in a single turn, so a multi-MiB batch can still hold the event loop for several milliseconds.
+- A producer yields to the event loop every 2 ms while it encodes the batches of one send to the brokers.
 - Install [`@node-rs/crc32`](/guide/installation#native-crc32c-recommended) for native checksums.
 
 ## Supported Libraries Summary

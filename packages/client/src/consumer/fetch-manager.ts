@@ -24,6 +24,7 @@ import type { FetchRequestTopic } from '@/protocol/messages/requests/fetch.js'
 import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { LoopSlice } from '@/utils/loop-slice.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
@@ -68,20 +69,6 @@ function corruptBatchError(error: unknown): Error {
  * without a bound one response can hold timers, sockets and handlers for tens of milliseconds.
  */
 const DECODE_SLICE_MS = 2
-
-/** Tracks how long decoding has run since it last yielded to the event loop. */
-class DecodeSlice {
-	private startedAt = performance.now()
-
-	get expired(): boolean {
-		return performance.now() - this.startedAt >= DECODE_SLICE_MS
-	}
-
-	async yield(): Promise<void> {
-		await new Promise<void>(resolve => setImmediate(resolve))
-		this.startedAt = performance.now()
-	}
-}
 
 function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): DecodedRecord[] {
 	if (records.length === 0) {
@@ -1090,7 +1077,7 @@ export class FetchManager {
 
 		// The socket callback that completed this response has already spent part of its loop turn
 		// reassembling the frame, so decoding starts on a turn of its own.
-		const slice = new DecodeSlice()
+		const slice = new LoopSlice(DECODE_SLICE_MS)
 		await slice.yield()
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {
@@ -1277,7 +1264,7 @@ export class FetchManager {
 		data: Buffer,
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint,
-		slice: DecodeSlice = new DecodeSlice()
+		slice: LoopSlice = new LoopSlice(DECODE_SLICE_MS)
 	): DecodedBatchResult | Promise<DecodedBatchResult> {
 		const decoder = new Decoder(data)
 		// Sequential offsets avoid per-record BigInt conversions; compacted batches fall back
@@ -1326,7 +1313,7 @@ export class FetchManager {
 		batches: DecodedRecordBatch[],
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint,
-		slice: DecodeSlice
+		slice: LoopSlice
 	): Promise<DecodedBatchResult> {
 		while (decoder.remaining() > 0) {
 			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
