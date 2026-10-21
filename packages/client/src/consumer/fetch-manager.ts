@@ -1120,6 +1120,13 @@ export class FetchManager {
 			})
 		} catch (error) {
 			session.handleError()
+			// A Broker whose connection dropped never reconnects by itself, and its partitions may have
+			// moved to another leader. Like the Java client on a disconnect, refresh metadata; the next
+			// leader lookup then reconnects, or skips the partition while its broker is unreachable.
+			for (const state of partitions) {
+				if (state.cachedLeader === broker) state.cachedLeader = null
+			}
+			await this.cluster.refreshMetadata([...new Set(partitions.map(state => state.topic))]).catch(() => {})
 			throw error
 		}
 
