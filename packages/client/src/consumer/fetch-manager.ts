@@ -16,6 +16,7 @@ import type { FetchRequestTopic } from '@/protocol/messages/requests/fetch.js'
 import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { LoopSlice } from '@/utils/loop-slice.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
@@ -27,6 +28,14 @@ function corruptDataError(topic: string, partition: number, offset: bigint, caus
 		`Failed to decode record batch (corrupt data) for ${topic}-${partition} at offset ${offset}: ${message}`
 	)
 }
+
+/**
+ * Longest run of synchronous work on a Fetch response before yielding to the event loop. Each
+ * partition's batches are checksummed and copied when the response arrives, which the JavaScript
+ * CRC32C fallback does at about 1 ms per MiB, so a response of several MiB would otherwise hold
+ * timers, sockets and handlers for as long.
+ */
+const RESPONSE_SLICE_MS = 2
 
 /** A partition whose buffered data failed to decode during a drain. */
 interface DrainFailure {
@@ -1076,8 +1085,13 @@ export class FetchManager {
 			topics,
 		})
 
+		// The socket callback that completed this response has already spent part of its loop turn
+		// reassembling the frame, so reading it starts on a turn of its own.
+		const slice = new LoopSlice(RESPONSE_SLICE_MS)
+		await slice.yield()
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {
+				if (slice.expired) await slice.yield()
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
 				const state = inflightStateByKey.get(key)
 				// Fence: state was revoked, the partition was paused, or a seek changed the fetch

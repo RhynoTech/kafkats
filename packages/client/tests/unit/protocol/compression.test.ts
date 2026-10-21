@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createRequire } from 'node:module'
+import { gzipSync, gunzipSync } from 'node:zlib'
 
 import {
 	CompressionType,
@@ -8,6 +9,7 @@ import {
 	createSnappyCodec,
 	createZstdCodec,
 	getCompressionTypeName,
+	gzipCodec,
 	type SnappyNativeLib,
 } from '@/protocol/records/compression.js'
 import {
@@ -183,6 +185,141 @@ describe('snappy Xerial framing', () => {
 
 		await expect(codec.decompress(oversized)).rejects.toThrow('Invalid Xerial-framed Snappy data')
 		await expect(codec.decompress(truncated)).rejects.toThrow('Invalid Xerial-framed Snappy data')
+	})
+})
+
+const json = (bytes: number) =>
+	Buffer.from('{"id":"8f1c","name":"Jane","city":"Detroit"},'.repeat(bytes / 45 + 1)).subarray(0, bytes)
+
+describe('snappy small-block fast path', () => {
+	type SyncSnappy = SnappyNativeLib & {
+		compressSync: (data: Buffer) => Buffer
+		uncompressSync: (data: Buffer) => Buffer
+	}
+	const snappy = createRequire(import.meta.url)('snappy') as SyncSnappy
+
+	function countingSnappy() {
+		const calls = { compress: 0, compressSync: 0, uncompress: 0, uncompressSync: 0 }
+		const lib: SyncSnappy = {
+			compress: data => (calls.compress++, snappy.compress(data)),
+			compressSync: data => (calls.compressSync++, snappy.compressSync(data)),
+			uncompress: data => (calls.uncompress++, snappy.uncompress(data)),
+			uncompressSync: data => (calls.uncompressSync++, snappy.uncompressSync(data)),
+		}
+		const codec = createSnappyCodec(lib)
+		calls.compress = 0 // the async-detection probe
+		return { codec, calls }
+	}
+
+	function xerialFrame(...blocks: Buffer[]): Buffer {
+		const int32 = (n: number) => {
+			const b = Buffer.alloc(4)
+			b.writeInt32BE(n)
+			return b
+		}
+		const header = Buffer.concat([
+			Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]),
+			int32(1),
+			int32(1),
+		])
+		return Buffer.concat([header, ...blocks.flatMap(b => [int32(b.length), b])])
+	}
+
+	it('compresses and decompresses small blocks synchronously', async () => {
+		const { codec, calls } = countingSnappy()
+		const payload = json(4096)
+
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+		expect(calls).toEqual({ compress: 0, compressSync: 1, uncompress: 0, uncompressSync: 1 })
+	})
+
+	it('keeps large blocks on the async API', async () => {
+		const { codec, calls } = countingSnappy()
+		const payload = json(256 * 1024)
+
+		// Buffer.equals: toEqual walks large buffers element by element
+		expect((await codec.decompress(await codec.compress(payload))).equals(payload)).toBe(true)
+		expect(calls).toEqual({ compress: 1, compressSync: 0, uncompress: 1, uncompressSync: 0 })
+	})
+
+	it('decodes Xerial chunks in order when only some go async', async () => {
+		const { codec, calls } = countingSnappy()
+		const parts = [json(1000), json(128 * 1024), Buffer.from('tail')]
+		const framed = xerialFrame(...parts.map(p => snappy.compressSync(p)))
+
+		expect((await codec.decompress(framed)).equals(Buffer.concat(parts))).toBe(true)
+		expect(calls.uncompressSync).toBe(2)
+		expect(calls.uncompress).toBe(1)
+	})
+
+	it('yields to the event loop between slices of a large Xerial batch', async () => {
+		const { codec, calls } = countingSnappy()
+		// snappy-java writes 32 KiB chunks, each small enough to decompress synchronously
+		const parts = Array.from({ length: 24 }, () => json(32 * 1024))
+		const framed = xerialFrame(...parts.map(p => snappy.compressSync(p)))
+
+		const chunksPerTurn: number[] = []
+		let seen = 0
+		const endTurn = () => {
+			chunksPerTurn.push(calls.uncompressSync - seen)
+			seen = calls.uncompressSync
+		}
+		const tick = () => {
+			endTurn()
+			if (seen < parts.length) setImmediate(tick)
+		}
+		setImmediate(tick)
+		const decoded = await codec.decompress(framed)
+		endTurn()
+
+		expect(decoded.equals(Buffer.concat(parts))).toBe(true)
+		expect(calls.uncompressSync).toBe(24)
+		expect(Math.max(...chunksPerTurn)).toBeLessThanOrEqual(8)
+	})
+
+	it('hands a block with an unreadable length preamble to the async API', async () => {
+		const { codec, calls } = countingSnappy()
+
+		await expect(codec.decompress(Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]))).rejects.toThrow()
+		expect(calls.uncompress).toBe(1)
+	})
+})
+
+describe('gzip codec', () => {
+	it('round-trips payloads on both sides of the sync size limits', async () => {
+		for (const size of [100, 6 * 1024, 48 * 1024, 300 * 1024]) {
+			const payload = json(size)
+			const compressed = await gzipCodec.compress(payload)
+			expect(gunzipSync(compressed).equals(payload)).toBe(true)
+			expect((await gzipCodec.decompress(compressed)).equals(payload)).toBe(true)
+		}
+	})
+
+	it('decodes concatenated members whatever the last trailer claims', async () => {
+		const [big, bigger, tail] = [json(200 * 1024), json(300 * 1024), Buffer.from('tail')]
+
+		const understated = Buffer.concat([gzipSync(big), gzipSync(tail)])
+		expect((await gzipCodec.decompress(understated)).equals(Buffer.concat([big, tail]))).toBe(true)
+		const chunked = Buffer.concat([gzipSync(bigger), gzipSync(big)])
+		expect((await gzipCodec.decompress(chunked)).equals(Buffer.concat([bigger, big]))).toBe(true)
+	})
+
+	it('does not pin an oversized buffer when bytes after the member overstate the trailer', async () => {
+		// zlib ignores bytes after the gzip member; read as ISIZE, these claim 4 GiB of output
+		const payload = json(10_000)
+		const padded = Buffer.concat([gzipSync(payload), Buffer.from([0, 0, 0, 0xff])])
+
+		const decoded = await gzipCodec.decompress(padded)
+		expect(decoded.equals(payload)).toBe(true)
+		// Record keys and values are views of this buffer, so its whole backing store stays alive
+		expect(decoded.buffer.byteLength).toBeLessThan(2 * payload.length)
+	})
+
+	it('rejects corrupt input instead of throwing synchronously', async () => {
+		const corrupt = Buffer.from('definitely not a gzip stream')
+		let result: Promise<Buffer> | undefined
+		expect(() => (result = gzipCodec.decompress(corrupt))).not.toThrow()
+		await expect(result).rejects.toThrow()
 	})
 })
 

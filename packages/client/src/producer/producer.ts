@@ -19,6 +19,7 @@ import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/p
 import { CompressionType } from '@/protocol/records/compression.js'
 import { ReconnectionStrategy } from '@/network/reconnection.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { LoopSlice } from '@/utils/loop-slice.js'
 import { sleep as sleepMs } from '@/utils/sleep.js'
 import { createRetryStrategyOptions, retry, type RetryOptions } from '@/utils/retry.js'
 import type { ConsumeContext } from '@/consumer/types.js'
@@ -105,6 +106,13 @@ function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
 
 /** Poll interval for CONCURRENT_TRANSACTIONS — matches the Java client's ADD_PARTITIONS_RETRY_BACKOFF_MS. */
 const CONCURRENT_TRANSACTIONS_POLL_MS = 20
+
+/**
+ * Longest run of synchronous batch encoding before yielding to the event loop. Small snappy and
+ * gzip batches compress synchronously, so a drain across hundreds of partitions would otherwise
+ * encode them all in one turn.
+ */
+const ENCODE_SLICE_MS = 2
 
 /**
  * Default producer configuration values
@@ -337,7 +345,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private async prepareProduceBatches(batches: PartitionBatch[]): Promise<PreparedProduceBatch[]> {
 		const preparedBatches: PreparedProduceBatch[] = []
+		const slice = new LoopSlice(ENCODE_SLICE_MS)
 		for (const batch of batches) {
+			if (slice.expired) await slice.yield()
 			const { topic, partition, messages } = batch
 			let recordCount = messages.length
 			let messagesToSend = messages

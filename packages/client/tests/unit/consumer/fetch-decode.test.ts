@@ -8,6 +8,7 @@ import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { CompressionType, gzipCodec } from '@/protocol/records/compression.js'
 import { createRecordBatch, encodeRecordBatch } from '@/protocol/records/index.js'
 import { crc32c } from '@/utils/crc32c.js'
+import { LoopSlice } from '@/utils/loop-slice.js'
 import { encodeBatch } from './helpers/completed-fetch.js'
 
 const broker = { nodeId: 1 }
@@ -239,6 +240,43 @@ describe('FetchManager lazy decoding', () => {
 		expect(fetch.data.buffer).not.toBe(response.buffer)
 		expect(fetch.data).toEqual(complete)
 		expect(fmAny.fetchBuffer.sizeBytes).toBe(complete.length)
+		fm.stop()
+	})
+})
+
+describe('FetchManager response slicing', () => {
+	it('yields between partitions once reading a response outlasts its slice, keeping response order', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		const partitions = [0, 1, 2, 3]
+		fm.addPartitions(partitions.map(partition => ({ topic: 't', partition, offset: 0n })))
+		vi.spyOn(LoopSlice.prototype, 'expired', 'get').mockReturnValue(true)
+		const yields = vi.spyOn(LoopSlice.prototype, 'yield')
+		await deliver(fmAny, Object.fromEntries(partitions.map(partition => [partition, encodeBatch([0n, 1n])])))
+
+		// One yield before the response is read, then one before each partition.
+		expect(yields).toHaveBeenCalledTimes(1 + partitions.length)
+		expect(fmAny.fetchBuffer.queue.map((fetch: { partition: number }) => fetch.partition)).toEqual(partitions)
+		expect((await fm.poll()).map(batch => [batch.partition, batch.records.length])).toEqual(
+			partitions.map(partition => [partition, 2])
+		)
+		fm.stop()
+	})
+
+	it('drops a partition paused while the response yielded before it', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([0, 1].map(partition => ({ topic: 't', partition, offset: 0n })))
+		vi.spyOn(LoopSlice.prototype, 'expired', 'get').mockReturnValue(true)
+		const yieldOnce = LoopSlice.prototype.yield
+		let yields = 0
+		vi.spyOn(LoopSlice.prototype, 'yield').mockImplementation(function (this: LoopSlice) {
+			if (++yields === 3) fm.pausePartitions([{ topic: 't', partition: 1 }])
+			return yieldOnce.call(this)
+		})
+		await deliver(fmAny, { 0: encodeBatch([0n, 1n]), 1: encodeBatch([0n, 1n]) })
+
+		expect(fmAny.fetchBuffer.queue.map((fetch: { partition: number }) => fetch.partition)).toEqual([0])
+		expect(fmAny.partitionStates.get('t:0').offset).toBe(2n)
+		expect(fmAny.partitionStates.get('t:1').offset).toBe(0n)
 		fm.stop()
 	})
 })

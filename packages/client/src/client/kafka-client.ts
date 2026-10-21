@@ -17,6 +17,7 @@ import type { ProducerConfig } from '@/producer/types.js'
 import { Admin } from '@/admin/admin.js'
 import type { AdminConfig } from '@/admin/types.js'
 import { createLogger, noopLogger, type Logger } from '@/logger.js'
+import { hasNativeCrc32c } from '@/utils/crc32c.js'
 import { createCreateTopicsRequest } from '@/protocol/messages/requests/create-topics.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { KafkaProtocolError } from './errors.js'
@@ -83,6 +84,11 @@ export class KafkaClient {
 		}
 
 		this.logger.info('initializing', { brokers: config.brokers })
+		if (!hasNativeCrc32c) {
+			this.logger.info(
+				'install @node-rs/crc32 for native CRC32C: the JavaScript fallback spends about 15x the CPU per checksummed byte'
+			)
+		}
 
 		const clusterConfig: ClusterConfig = {
 			brokers: config.brokers,
