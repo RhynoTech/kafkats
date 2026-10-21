@@ -252,6 +252,31 @@ describe('snappy small-block fast path', () => {
 		expect(calls.uncompress).toBe(1)
 	})
 
+	it('yields to the event loop between slices of a large Xerial batch', async () => {
+		const { codec, calls } = countingSnappy()
+		// snappy-java writes 32 KiB chunks, each small enough to decompress synchronously
+		const parts = Array.from({ length: 24 }, () => json(32 * 1024))
+		const framed = xerialFrame(...parts.map(p => snappy.compressSync(p)))
+
+		const chunksPerTurn: number[] = []
+		let seen = 0
+		const endTurn = () => {
+			chunksPerTurn.push(calls.uncompressSync - seen)
+			seen = calls.uncompressSync
+		}
+		const tick = () => {
+			endTurn()
+			if (seen < parts.length) setImmediate(tick)
+		}
+		setImmediate(tick)
+		const decoded = await codec.decompress(framed)
+		endTurn()
+
+		expect(decoded.equals(Buffer.concat(parts))).toBe(true)
+		expect(calls.uncompressSync).toBe(24)
+		expect(Math.max(...chunksPerTurn)).toBeLessThanOrEqual(8)
+	})
+
 	it('hands a block with an unreadable length preamble to the async API', async () => {
 		const { codec, calls } = countingSnappy()
 

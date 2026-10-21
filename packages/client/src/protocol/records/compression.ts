@@ -152,6 +152,9 @@ export type SnappyLib = SnappyNativeLib | SnappyJsLib
 // chunks of [int32 BE compressed length][snappy block].
 const XERIAL_MAGIC = Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]) // \x82SNAPPY\0
 const XERIAL_HEADER_SIZE = 16
+// Java producers write 32 KiB chunks, each under the sync threshold below, so one large batch
+// would otherwise decompress hundreds of them in a single loop turn.
+const XERIAL_SLICE_DECODED_BYTES = 256 * 1024
 
 // Below these sizes a synchronous native snappy call costs the event loop less than the async
 // API's threadpool round trip (35-50 µs of main-thread time per call); above them the async call
@@ -209,14 +212,24 @@ function decompressSnappy(data: Buffer, decompressBlock: DecompressBlock): Buffe
 	return decompressXerialChunks(data, decompressBlock, XERIAL_HEADER_SIZE, [])
 }
 
-/** Decompresses chunks in order, going async only from the first chunk the codec decompresses async. */
+/**
+ * Decompresses chunks in order, going async only from the first chunk the codec decompresses async,
+ * and yielding to the event loop after each XERIAL_SLICE_DECODED_BYTES of synchronous output.
+ */
 function decompressXerialChunks(
 	data: Buffer,
 	decompressBlock: DecompressBlock,
 	offset: number,
 	chunks: Buffer[]
 ): Buffer | Promise<Buffer> {
+	let decodedThisTurn = 0
 	while (offset < data.length) {
+		if (decodedThisTurn >= XERIAL_SLICE_DECODED_BYTES) {
+			const next = offset
+			return new Promise<void>(resolve => setImmediate(resolve)).then(() =>
+				decompressXerialChunks(data, decompressBlock, next, chunks)
+			)
+		}
 		if (offset + 4 > data.length) {
 			throw new Error('Invalid Xerial-framed Snappy data: truncated chunk length')
 		}
@@ -237,6 +250,7 @@ function decompressXerialChunks(
 			})
 		}
 		chunks.push(chunk)
+		decodedThisTurn += chunk.length
 	}
 	// A batch that fits one chunk is already contiguous; concatenating it would only copy it.
 	return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)

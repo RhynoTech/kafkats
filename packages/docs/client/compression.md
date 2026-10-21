@@ -194,7 +194,7 @@ Consumers decompress and checksum record batches on the event loop, so this work
 
 - The native `snappy` library is called synchronously for blocks of up to 64 KiB decoded (Java producers write 32 KiB blocks), where a libuv threadpool round trip would cost more than the decompression, and asynchronously for larger blocks.
 - The built-in gzip codec uses Node's async zlib above 8 KiB of input or 64 KiB of output.
-- Decoding a fetch response yields to the event loop every 2 ms.
+- Decoding a fetch response yields to the event loop between record batches once it has run for 2 ms, and within a Xerial-framed snappy batch after every 256 KiB of decompressed output. The records of one batch are decoded in a single turn, so a multi-MiB batch can still hold the event loop for several milliseconds.
 - Install [`@node-rs/crc32`](/guide/installation#native-crc32c-recommended) for native checksums.
 
 ## Supported Libraries Summary
