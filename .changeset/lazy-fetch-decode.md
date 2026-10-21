@@ -20,5 +20,7 @@ Priority strategies see `bufferedBytes` and `bufferCapacityBytes` in the same fe
 still count decoded records.
 
 Corrupt record data found by the client (CRC mismatch, bad framing, a batch that fails to decompress) is now raised
-from the next poll like a broker `CORRUPT_MESSAGE`, after the records before it are delivered, with the fetch position
-left at the bad batch. Previously it was logged and the partition was re-fetched in a loop.
+like a broker `CORRUPT_MESSAGE`: the records before the bad batch are delivered first, the error names the bad batch's
+offset, and the fetch position is left at the first record not delivered, so seeking past the batch resumes
+consumption. The partition is not fetched again while the bad batch waits behind those records. Previously it was
+logged and the partition was re-fetched in a loop.

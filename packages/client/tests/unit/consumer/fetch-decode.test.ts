@@ -97,7 +97,7 @@ afterEach(() => {
 })
 
 describe('FetchManager lazy decoding', () => {
-	it('surfaces corrupt fetched data from the next poll and keeps buffering the other partitions', async () => {
+	it('surfaces corrupt data from the poll after the one reaching it, buffering the other partitions', async () => {
 		const { fm, fmAny } = await makeFetchManager()
 		fm.addPartitions([
 			{ topic: 't', partition: 0, offset: 0n },
@@ -109,8 +109,8 @@ describe('FetchManager lazy decoding', () => {
 		expect(fmAny.partitionStates.get('t:0').offset).toBe(0n)
 		expect(fmAny.partitionStates.get('t:1').offset).toBe(2n)
 
-		await expect(fm.poll()).rejects.toThrow(/corrupt data.*t-0 at offset 0/)
 		expect(offsetsOf(await fm.poll())).toEqual([0n, 1n])
+		await expect(fm.poll()).rejects.toThrow(/corrupt data.*t-0 at offset 0/)
 		fm.stop()
 	})
 

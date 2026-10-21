@@ -48,8 +48,14 @@ interface BatchHeader extends Omit<FetchedBatch, 'aborted' | 'allVisible'> {
 	producerId: bigint
 }
 
+interface Corruption {
+	/** The bad batch's base offset; null when too few bytes are left to hold one. */
+	offset: bigint | null
+	error: unknown
+}
+
 export interface FetchedRecords {
-	/** Offset after the last complete batch, control and empty batches included; null if none is complete. */
+	/** Offset after the last complete batch before any corrupt one, control and empty batches included; else null. */
 	nextOffset: bigint | null
 	/** Records at or after the fetch offset that are neither control records nor aborted. */
 	recordCount: number
@@ -58,6 +64,8 @@ export interface FetchedRecords {
 	batches: FetchedBatch[]
 	/** A copy of the bytes from the first to the last of those batches. */
 	data: Buffer
+	/** A batch after those that failed validation or decoding, raised once their records are drained. */
+	corruption: Corruption | null
 }
 
 export interface ReadFetchedRecordsOptions {
@@ -70,8 +78,9 @@ export interface ReadFetchedRecordsOptions {
 
 /**
  * Locate the record batches in a partition's fetched bytes and count the records a drain will
- * deliver once it applies the offset, control-batch and aborted-transaction filters. Throws on
- * corrupt data.
+ * deliver once it applies the offset, control-batch and aborted-transaction filters. Corrupt data
+ * ends the batches read at the bad batch, which is returned as `corruption`, as the Java client's
+ * CompletedFetch delivers the records before a corrupt batch.
  *
  * Returns a promise only when a compacted batch straddles the fetch offset or an aborted range:
  * its surviving offsets are known only after decoding it.
@@ -80,13 +89,7 @@ export function readFetchedRecords(
 	data: Buffer,
 	options: ReadFetchedRecordsOptions
 ): FetchedRecords | Promise<FetchedRecords> {
-	const headers = readBatchHeaders(data, options.verifyCrc)
-
-	let nextOffset: bigint | null = null
-	for (const header of headers) {
-		const end = header.baseOffset + BigInt(header.lastOffsetDelta) + 1n
-		if (nextOffset === null || end > nextOffset) nextOffset = end
-	}
+	let { headers, corruption } = readBatchHeaders(data, options.verifyCrc)
 
 	const abortedRanges = options.readCommitted ? abortedRangesOf(headers, options) : []
 	const { fetchOffset } = options
@@ -110,16 +113,35 @@ export function readFetchedRecords(
 			batches.push(batch)
 			recordCount += count
 		}
-		return { nextOffset, recordCount, fetchOffset, ...copyBatches(data, batches) }
+		return { nextOffset: endOffset(headers), recordCount, fetchOffset, corruption, ...copyBatches(data, batches) }
 	}
 
 	if (counted.every(({ count }) => count !== null)) return finish()
 	return (async () => {
-		for (const entry of counted) {
-			if (entry.count === null) entry.count = await countByDecoding(data, entry.batch, fetchOffset)
+		for (const [index, entry] of counted.entries()) {
+			if (entry.count !== null) continue
+			try {
+				entry.count = await countByDecoding(data, entry.batch, fetchOffset)
+			} catch (error) {
+				const { start, baseOffset } = entry.batch
+				counted.length = index
+				headers = headers.filter(header => header.start < start)
+				corruption = { offset: baseOffset, error }
+				break
+			}
 		}
 		return finish()
 	})()
+}
+
+/** Offset after the last of the given batches, control and empty batches included; null if none. */
+function endOffset(headers: BatchHeader[]): bigint | null {
+	let nextOffset: bigint | null = null
+	for (const header of headers) {
+		const end = header.baseOffset + BigInt(header.lastOffsetDelta) + 1n
+		if (nextOffset === null || end > nextOffset) nextOffset = end
+	}
+	return nextOffset
 }
 
 /** Estimated in-memory size of a decoded record; drives the per-partition batch cap and the poll budget. */
@@ -151,6 +173,8 @@ export class CompletedFetch {
 	/** A batch being decompressed; decoding waits for it so records stay in order. */
 	private opening: Promise<void> | null = null
 	private failure: { error: unknown } | null = null
+	/** A batch found corrupt when fetched, raised once every record before it is consumed. */
+	readonly corruption: Corruption | null
 
 	constructor(
 		readonly topic: string,
@@ -164,6 +188,7 @@ export class CompletedFetch {
 		this.undecoded = records.recordCount
 		this.position = records.fetchOffset
 		this.consumedPosition = records.fetchOffset
+		this.corruption = records.corruption
 	}
 
 	/**
@@ -175,7 +200,13 @@ export class CompletedFetch {
 	}
 
 	get isEmpty(): boolean {
-		return this.undecoded === 0 && this.head === this.tail
+		return this.undecoded === 0 && this.head === this.tail && this.corruption === null
+	}
+
+	/** Where a drain's error from this fetch lies: the corrupt batch, else the first undelivered record. */
+	failedAt(error: unknown): bigint {
+		const corruption = this.corruption
+		return (corruption !== null && error === corruption.error ? corruption.offset : null) ?? this.position
 	}
 
 	/** The next deliverable record, without consuming it; null once every record was consumed. */
@@ -248,6 +279,7 @@ export class CompletedFetch {
 			throw error
 		}
 		this.undecoded = 0
+		if (this.corruption) throw this.corruption.error
 		return false
 	}
 
@@ -324,45 +356,53 @@ function openBatch(data: Buffer, batch: FetchedBatch): BatchReader | Promise<Bat
 	return codec.decompress(records).then(decompressed => new BatchReader(batch, decompressed, decompressed.length))
 }
 
-function readBatchHeaders(data: Buffer, verifyCrc: boolean): BatchHeader[] {
+/** The headers of the complete batches up to the first one that fails validation. */
+function readBatchHeaders(data: Buffer, verifyCrc: boolean): { headers: BatchHeader[]; corruption: Corruption | null } {
 	const headers: BatchHeader[] = []
 	let start = 0
-	while (start < data.length) {
-		const remaining = data.length - start
-		if (remaining < LENGTH_PREFIX_BYTES || remaining < LENGTH_PREFIX_BYTES + data.readInt32BE(start + 8)) {
-			// The broker may cut the trailing batch at maxBytes but always returns the first one whole,
-			// so only a cut after a complete batch is truncation; anything else is corruption.
-			if (headers.length > 0) break
-			throw new Error(`truncated record batch: ${remaining} bytes`)
-		}
-		const end = start + LENGTH_PREFIX_BYTES + data.readInt32BE(start + 8)
-		if (end - start < HEADER_BYTES)
-			throw new Error(`Invalid record batch length ${end - start - LENGTH_PREFIX_BYTES}`)
-		const magic = data.readInt8(start + 16)
-		if (magic !== 2) throw new Error(`Unsupported record batch magic: ${magic}, expected 2`)
-		if (verifyCrc) {
-			const storedCrc = data.readUInt32BE(start + 17)
-			const computedCrc = crc32c(data, start + CRC_START, end - start - CRC_START)
-			if (storedCrc !== computedCrc) {
-				throw new Error(`CRC mismatch: stored=${storedCrc.toString(16)}, computed=${computedCrc.toString(16)}`)
+	try {
+		while (start < data.length) {
+			const remaining = data.length - start
+			if (remaining < LENGTH_PREFIX_BYTES || remaining < LENGTH_PREFIX_BYTES + data.readInt32BE(start + 8)) {
+				// The broker may cut the trailing batch at maxBytes but always returns the first one whole,
+				// so only a cut after a complete batch is truncation; anything else is corruption.
+				if (headers.length > 0) break
+				throw new Error(`truncated record batch: ${remaining} bytes`)
 			}
+			const end = start + LENGTH_PREFIX_BYTES + data.readInt32BE(start + 8)
+			if (end - start < HEADER_BYTES)
+				throw new Error(`Invalid record batch length ${end - start - LENGTH_PREFIX_BYTES}`)
+			const magic = data.readInt8(start + 16)
+			if (magic !== 2) throw new Error(`Unsupported record batch magic: ${magic}, expected 2`)
+			if (verifyCrc) {
+				const storedCrc = data.readUInt32BE(start + 17)
+				const computedCrc = crc32c(data, start + CRC_START, end - start - CRC_START)
+				if (storedCrc !== computedCrc) {
+					throw new Error(
+						`CRC mismatch: stored=${storedCrc.toString(16)}, computed=${computedCrc.toString(16)}`
+					)
+				}
+			}
+			const recordCount = data.readInt32BE(start + 57)
+			if (recordCount < 0) throw new Error(`Invalid record count ${recordCount} in record batch`)
+			headers.push({
+				start,
+				end,
+				baseOffset: data.readBigInt64BE(start),
+				attributes: data.readInt16BE(start + 21),
+				lastOffsetDelta: data.readInt32BE(start + 23),
+				baseTimestamp: data.readBigInt64BE(start + 27),
+				maxTimestamp: data.readBigInt64BE(start + 35),
+				producerId: data.readBigInt64BE(start + 43),
+				recordCount,
+			})
+			start = end
 		}
-		const recordCount = data.readInt32BE(start + 57)
-		if (recordCount < 0) throw new Error(`Invalid record count ${recordCount} in record batch`)
-		headers.push({
-			start,
-			end,
-			baseOffset: data.readBigInt64BE(start),
-			attributes: data.readInt16BE(start + 21),
-			lastOffsetDelta: data.readInt32BE(start + 23),
-			baseTimestamp: data.readBigInt64BE(start + 27),
-			maxTimestamp: data.readBigInt64BE(start + 35),
-			producerId: data.readBigInt64BE(start + 43),
-			recordCount,
-		})
-		start = end
+	} catch (error) {
+		const offset = data.length - start >= 8 ? data.readBigInt64BE(start) : null
+		return { headers, corruption: { offset, error } }
 	}
-	return headers
+	return { headers, corruption: null }
 }
 
 /** Each aborted transaction ends at its producer's next marker in this response, else at the LSO. */

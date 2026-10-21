@@ -188,19 +188,42 @@ describe('readFetchedRecords', () => {
 		}
 	})
 
-	it('throws on a corrupt first batch instead of treating it as truncation', async () => {
-		expect(() => read(Buffer.from([1, 2, 3, 4, 5]), { fetchOffset: 0n })).toThrow(/truncated/)
-		const badMagic = Buffer.from(await batch([0n]))
+	it('reports a corrupt first batch instead of treating it as truncation', async () => {
+		expect(read(Buffer.from([1, 2, 3, 4, 5]), { fetchOffset: 0n })).toMatchObject({
+			recordCount: 0,
+			nextOffset: null,
+			corruption: {
+				offset: null,
+				error: expect.objectContaining({ message: expect.stringMatching(/truncated/) }),
+			},
+		})
+		const badMagic = Buffer.from(await batch([3n]))
 		badMagic.writeInt8(1, 16)
-		expect(() => read(badMagic)).toThrow(/magic/)
+		expect(read(badMagic)).toMatchObject({
+			recordCount: 0,
+			corruption: { offset: 3n, error: expect.objectContaining({ message: expect.stringMatching(/magic/) }) },
+		})
 	})
 
-	it('throws on a complete batch with a bad CRC after the first, and skips the check when disabled', async () => {
-		const second = Buffer.from(await batch([1n]))
-		second.writeUInt8(second.readUInt8(second.length - 1) ^ 0xff, second.length - 1)
-		const data = Buffer.concat([await batch([0n]), second])
-		expect(() => read(data)).toThrow(/CRC mismatch/)
-		expect(await read(data, { verifyCrc: false })).toMatchObject({ recordCount: 2 })
+	it('keeps the batches before one with a bad CRC, and skips the check when disabled', async () => {
+		const third = Buffer.from(await batch([5n, 6n]))
+		third.writeUInt8(third.readUInt8(third.length - 1) ^ 0xff, third.length - 1)
+		const data = Buffer.concat([await batch([0n, 1n]), await batch([2n], { control: true }), third])
+		const fetched = await read(data)
+		expect(fetched).toMatchObject({ recordCount: 2, nextOffset: 3n, corruption: { offset: 5n } })
+		expect(String(fetched.corruption?.error)).toMatch(/CRC mismatch/)
+		expect(fetched.batches.map(batch => batch.baseOffset)).toEqual([0n])
+		expect(await read(data, { verifyCrc: false })).toMatchObject({ recordCount: 4, corruption: null })
+	})
+
+	it('keeps the batches before a straddled compacted batch that fails to decompress', async () => {
+		const data = Buffer.concat([
+			await batch([0n, 1n]),
+			corruptPayload(await batch([2n, 5n, 9n], { compression: CompressionType.Gzip })),
+		])
+		const fetched = read(data, { fetchOffset: 4n })
+		expect(fetched).toBeInstanceOf(Promise)
+		expect(await fetched).toMatchObject({ recordCount: 0, nextOffset: 2n, corruption: { offset: 2n } })
 	})
 })
 
@@ -247,6 +270,21 @@ describe('CompletedFetch', () => {
 		expect(lazy).toEqual(eager)
 		expect(lazy.map(record => record.offset)).toEqual([0n, 1n, 2n, 3n, 5n, 6n, 7n])
 		expect(lazy[6]!.timestamp).toBe(1_007n)
+	})
+
+	it('raises a corrupt batch found by the read once the records before it are consumed', async () => {
+		const second = Buffer.from(await batch([4n]))
+		second.writeUInt8(second.readUInt8(second.length - 1) ^ 0xff, second.length - 1)
+		const fetch = new CompletedFetch('t', 0, 0, await read(Buffer.concat([await batch([0n, 1n]), second])))
+		for (const offset of [0n, 1n]) {
+			expect((await fetch.peek())!.offset).toBe(offset)
+			fetch.consume()
+		}
+		fetch.commit()
+		expect(fetch.isEmpty).toBe(false)
+		expect(() => fetch.peek()).toThrow(/CRC mismatch/)
+		expect(fetch.failedAt(fetch.corruption!.error)).toBe(4n)
+		expect(fetch.failedAt(new Error('decode'))).toBe(2n)
 	})
 
 	it('throws from a drain, not from the read, when a compressed batch fails to decompress', async () => {

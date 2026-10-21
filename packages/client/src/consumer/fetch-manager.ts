@@ -18,7 +18,7 @@ import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
-import { CompletedFetch, readFetchedRecords, recordBytes, type FetchedRecords } from './completed-fetch.js'
+import { CompletedFetch, readFetchedRecords, recordBytes } from './completed-fetch.js'
 
 function corruptDataError(topic: string, partition: number, offset: bigint, cause: unknown): Error {
 	const message = cause instanceof Error ? cause.message : String(cause)
@@ -263,6 +263,13 @@ class FetchBuffer {
 			else stats.set(key, { topic: fetch.topic, partition: fetch.partition, bytes: fetch.heldBytes })
 		}
 		return Array.from(stats.values())
+	}
+
+	/** Partitions holding a corrupt batch that no drain has raised yet. */
+	corruptPartitions(): Set<string> {
+		const keys = new Set<string>()
+		for (const fetch of this.queue) if (fetch.corruption) keys.add(tpKey(fetch.topic, fetch.partition))
+		return keys
 	}
 
 	hasDataFor(excludedPartitions?: PartitionKeys): boolean {
@@ -872,8 +879,9 @@ export class FetchManager {
 
 				// Get ready (non-paused) partitions - reuse array
 				readyPartitions.length = 0
-				for (const state of this.partitionStates.values()) {
-					if (!state.paused) {
+				const corrupt = fetchBuffer.corruptPartitions()
+				for (const [key, state] of this.partitionStates) {
+					if (!state.paused && !corrupt.has(key)) {
 						readyPartitions.push(state)
 					}
 				}
@@ -1084,32 +1092,27 @@ export class FetchManager {
 
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
 					const fetchOffset = state.offset
-					const stale = () =>
+					const read = readFetchedRecords(partitionResponse.recordsData, {
+						fetchOffset,
+						abortedTransactions: partitionResponse.abortedTransactions,
+						lastStableOffset: partitionResponse.lastStableOffset,
+						readCommitted: this.config.isolationLevel === 'read_committed',
+						verifyCrc: this.config.checkCrcs !== false,
+					})
+					const fetched = read instanceof Promise ? await read : read
+
+					// Reading may have awaited a decode; re-fence (revoked, paused, or seeked meanwhile).
+					if (
 						state.abortController.signal.aborted ||
 						state.paused ||
 						state.fetchEpoch !== issuedEpochByKey.get(key)
-					let fetched: FetchedRecords
-					try {
-						const read = readFetchedRecords(partitionResponse.recordsData, {
-							fetchOffset,
-							abortedTransactions: partitionResponse.abortedTransactions,
-							lastStableOffset: partitionResponse.lastStableOffset,
-							readCommitted: this.config.isolationLevel === 'read_committed',
-							verifyCrc: this.config.checkCrcs !== false,
-						})
-						fetched = read instanceof Promise ? await read : read
-					} catch (error) {
-						// Re-fetching returns the same bytes, so this is surfaced like a broker CORRUPT_MESSAGE,
-						// with the position left at the bad batch for the user to seek past.
-						if (!stale())
-							this.pendingError = corruptDataError(state.topic, state.partition, fetchOffset, error)
+					)
 						continue
-					}
 
-					// Reading may have awaited a decode; re-fence (revoked, paused, or seeked meanwhile).
-					if (stale()) continue
-
-					if (fetched.recordCount > 0) {
+					// A corrupt batch is buffered behind the records before it, so a drain delivers them and
+					// then raises it like a broker CORRUPT_MESSAGE. Re-fetching returns the same bytes, so the
+					// partition is not fetched again until then.
+					if (fetched.recordCount > 0 || fetched.corruption) {
 						const assignmentEpoch = this.getAssignmentEpoch(state.topic, state.partition)
 						this.fetchBuffer.add(new CompletedFetch(state.topic, state.partition, assignmentEpoch, fetched))
 					}
@@ -1203,6 +1206,8 @@ export class FetchManager {
 		const { batches, failures } = await fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, plan)
 		for (const { fetch, error } of failures) this.failCorruptFetch(fetch, error)
 		this.scheduleStage()
+		// With no records to deliver first, the corrupt data is raised from this poll.
+		if (batches.length === 0) this.throwPendingError()
 		return batches
 	}
 
@@ -1233,9 +1238,10 @@ export class FetchManager {
 	}
 
 	/**
-	 * Surface data that failed to decode during a drain like a broker CORRUPT_MESSAGE, after the
-	 * records before it are delivered. The fetch position rewinds to the first undelivered record,
-	 * which re-fetching would fail on again, so the user can seek past it.
+	 * Surface corrupt data a drain reached like a broker CORRUPT_MESSAGE, after the records before it
+	 * are delivered, naming the bad batch's offset when it is known. The fetch position rewinds to
+	 * the first undelivered record, which re-fetching would fail on again, so the user can seek past
+	 * the bad batch.
 	 */
 	private failCorruptFetch(fetch: CompletedFetch, error: unknown): void {
 		const { topic, partition } = fetch
@@ -1246,7 +1252,7 @@ export class FetchManager {
 			// Fence a fetch already issued past the bad batch so it cannot move the position again.
 			state.fetchEpoch++
 		}
-		this.pendingError = corruptDataError(topic, partition, fetch.position, error)
+		this.pendingError = corruptDataError(topic, partition, fetch.failedAt(error), error)
 	}
 
 	/** Buffered partitions first (in buffer order), then idle assigned partitions with zero buffered. */
