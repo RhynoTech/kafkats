@@ -12,12 +12,13 @@ import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { KafkaProtocolError } from '@/client/errors.js'
 import {
+	COMPRESSION_CODEC_MASK,
 	decodeRecordBatchFrom,
 	decodeRecordBatchFromSync,
 	isControlBatch,
 	isTransactional,
 } from '@/protocol/records/index.js'
-import type { DecodedRecord } from '@/protocol/records/index.js'
+import type { DecodedRecord, DecodedRecordBatch, DecodeRecordBatchOptions } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
 import type { FetchRequestTopic } from '@/protocol/messages/requests/fetch.js'
 import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
@@ -42,6 +43,44 @@ function isTruncatedTrailingBatch(decoder: Decoder): boolean {
 	const batchLength = decoder.readInt32()
 	decoder.seek(batchStart)
 	return decoder.remaining() < 12 + batchLength
+}
+
+/** True when the batch at the decoder's position declares a compression codec. Does not consume. */
+function isCompressedBatch(decoder: Decoder): boolean {
+	if (decoder.remaining() < 23) {
+		return false
+	}
+	const batchStart = decoder.offset()
+	// attributes (int16) follow baseOffset(8) batchLength(4) partitionLeaderEpoch(4) magic(1) crc(4)
+	decoder.seek(batchStart + 21)
+	const attributes = decoder.readInt16()
+	decoder.seek(batchStart)
+	return (attributes & COMPRESSION_CODEC_MASK) !== 0
+}
+
+function corruptBatchError(error: unknown): Error {
+	return new Error(`Failed to decode record batch (corrupt data): ${(error as Error).message}`)
+}
+
+/**
+ * Longest run of synchronous decoding before yielding to the event loop. A fetch response can
+ * carry many partitions of several MiB each, and decoding runs at roughly 2-10 ms per wire MiB, so
+ * without a bound one response can hold timers, sockets and handlers for tens of milliseconds.
+ */
+const DECODE_SLICE_MS = 2
+
+/** Tracks how long decoding has run since it last yielded to the event loop. */
+class DecodeSlice {
+	private startedAt = performance.now()
+
+	get expired(): boolean {
+		return performance.now() - this.startedAt >= DECODE_SLICE_MS
+	}
+
+	async yield(): Promise<void> {
+		await new Promise<void>(resolve => setImmediate(resolve))
+		this.startedAt = performance.now()
+	}
 }
 
 function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): DecodedRecord[] {
@@ -1049,8 +1088,13 @@ export class FetchManager {
 			topics,
 		})
 
+		// The socket callback that completed this response has already spent part of its loop turn
+		// reassembling the frame, so decoding starts on a turn of its own.
+		const slice = new DecodeSlice()
+		await slice.yield()
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {
+				if (slice.expired) await slice.yield()
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
 				const state = inflightStateByKey.get(key)
 				// Fence: state was revoked, the partition was paused, or a seek changed the fetch
@@ -1075,7 +1119,8 @@ export class FetchManager {
 					const decodeResult = this.decodeRecords(
 						partitionResponse.recordsData,
 						partitionResponse.abortedTransactions,
-						partitionResponse.lastStableOffset
+						partitionResponse.lastStableOffset,
+						slice
 					)
 					const { records: decoded, nextOffset } =
 						decodeResult instanceof Promise ? await decodeResult : decodeResult
@@ -1225,28 +1270,26 @@ export class FetchManager {
 	/**
 	 * Decode records from raw buffer
 	 * Returns DecodedRecord[] directly for better performance (avoids intermediate Message creation)
-	 * Returns sync result or Promise depending on whether compression is encountered
+	 * Decodes synchronously until a batch is compressed or the decode slice runs out, then
+	 * continues asynchronously from that batch
 	 */
 	private decodeRecords(
 		data: Buffer,
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
-		lastStableOffset: bigint
+		lastStableOffset: bigint,
+		slice: DecodeSlice = new DecodeSlice()
 	): DecodedBatchResult | Promise<DecodedBatchResult> {
 		const decoder = new Decoder(data)
+		// Sequential offsets avoid per-record BigInt conversions; compacted batches fall back
+		const options: DecodeRecordBatchOptions = {
+			assumeSequentialOffsets: true,
+			verifyCrc: this.config.checkCrcs !== false,
+		}
 
 		// Decode all record batches first so we can:
 		// - drop control batches
 		// - filter aborted transactional records for read_committed
-		const batches: Array<{
-			attributes: number
-			producerId: bigint
-			baseOffset: bigint
-			lastOffsetDelta: number
-			records: DecodedRecord[]
-		}> = []
-
-		// Try synchronous decoding first (faster, no promise overhead)
-		let needsAsync = false
+		const batches: DecodedRecordBatch[] = []
 		while (decoder.remaining() > 0) {
 			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
 			// underflow). The broker always returns the FIRST batch complete, so underflow with
@@ -1256,69 +1299,48 @@ export class FetchManager {
 			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
 				break
 			}
+			if (slice.expired || isCompressedBatch(decoder)) {
+				return this.decodeRemainingRecords(
+					decoder,
+					options,
+					batches,
+					abortedTransactions,
+					lastStableOffset,
+					slice
+				)
+			}
 			try {
-				// Hot-path decode options:
-				// - Assume sequential offsets to avoid per-record BigInt conversions
-				const batch = decodeRecordBatchFromSync(decoder, {
-					assumeSequentialOffsets: true,
-					verifyCrc: this.config.checkCrcs !== false,
-				})
-				batches.push(batch)
+				batches.push(decodeRecordBatchFromSync(decoder, options))
 			} catch (e) {
-				// If sync failed due to compression, switch to async path
-				if ((e as Error).message.includes('cannot decode compressed')) {
-					needsAsync = true
-					break
-				}
-				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
+				throw corruptBatchError(e)
 			}
 		}
 
-		// If compression was encountered, use async decode
-		if (needsAsync) {
-			return this.decodeRecordsAsync(data, abortedTransactions, lastStableOffset)
-		}
-
-		// Sync path - process batches directly
 		return this.processBatches(batches, abortedTransactions, lastStableOffset)
 	}
 
-	/**
-	 * Async decode path for compressed batches
-	 */
-	private async decodeRecordsAsync(
-		data: Buffer,
+	/** Continues decodeRecords from the decoder's position, awaiting compressed batches and slice ends. */
+	private async decodeRemainingRecords(
+		decoder: Decoder,
+		options: DecodeRecordBatchOptions,
+		batches: DecodedRecordBatch[],
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
-		lastStableOffset: bigint
+		lastStableOffset: bigint,
+		slice: DecodeSlice
 	): Promise<DecodedBatchResult> {
-		const decoder = new Decoder(data)
-		const batches: Array<{
-			attributes: number
-			producerId: bigint
-			baseOffset: bigint
-			lastOffsetDelta: number
-			records: DecodedRecord[]
-		}> = []
-
 		while (decoder.remaining() > 0) {
-			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
-			// underflow). The broker always returns the FIRST batch complete, so underflow with
-			// nothing decoded is corruption; and any decode failure on a fully-present batch
-			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
-			// silently drop records and leave the partition re-fetching the same data forever.
 			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
 				break
 			}
+			if (slice.expired) await slice.yield()
 			try {
-				// Hot-path decode options:
-				// - Assume sequential offsets to avoid per-record BigInt conversions
-				const batch = await decodeRecordBatchFrom(decoder, {
-					assumeSequentialOffsets: true,
-					verifyCrc: this.config.checkCrcs !== false,
-				})
-				batches.push(batch)
+				batches.push(
+					isCompressedBatch(decoder)
+						? await decodeRecordBatchFrom(decoder, options)
+						: decodeRecordBatchFromSync(decoder, options)
+				)
 			} catch (e) {
-				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
+				throw corruptBatchError(e)
 			}
 		}
 
@@ -1329,13 +1351,7 @@ export class FetchManager {
 	 * Process decoded batches into records
 	 */
 	private processBatches(
-		batches: Array<{
-			attributes: number
-			producerId: bigint
-			baseOffset: bigint
-			lastOffsetDelta: number
-			records: DecodedRecord[]
-		}>,
+		batches: DecodedRecordBatch[],
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint
 	): DecodedBatchResult {

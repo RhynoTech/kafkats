@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
@@ -88,5 +88,44 @@ describe('FetchManager.decodeRecords corruption handling', () => {
 
 		const { records } = await fm.decodeRecords(buf, [], 100n)
 		expect(records.map((r: DecodedRecord) => r.value?.toString('utf-8'))).toEqual(['hello'])
+	})
+})
+
+describe('FetchManager.decodeRecords single pass', () => {
+	const values = (records: DecodedRecord[]) => records.map(r => r.value?.toString('utf-8'))
+
+	it('decodes uncompressed batches around a compressed one in order, in one pass', async () => {
+		const fm = makeFetchManager()
+		const first = encodeRecordBatchSync(createRecordBatch([{ value: 'a', timestamp: 0 }], 0n, 0n))
+		const second = await encodeRecordBatch(createRecordBatch([{ value: 'b', timestamp: 0 }], 1n, 0n), {
+			compression: CompressionType.Gzip,
+		})
+		const third = encodeRecordBatchSync(createRecordBatch([{ value: 'c', timestamp: 0 }], 2n, 0n))
+
+		const result = fm.decodeRecords(Buffer.concat([first, second, third]), [], 100n)
+		expect(result).toBeInstanceOf(Promise)
+		const { records, nextOffset } = await result
+		expect(values(records)).toEqual(['a', 'b', 'c'])
+		expect(nextOffset).toBe(3n)
+	})
+
+	it('yields to the event loop once decoding outlasts its time slice', async () => {
+		const fm = makeFetchManager()
+		const batches = Array.from({ length: 6 }, (_, i) =>
+			encodeRecordBatchSync(createRecordBatch([{ value: `v${i}`, timestamp: 0 }], BigInt(i), 0n))
+		)
+		let now = 0
+		const clock = vi.spyOn(performance, 'now').mockImplementation(() => (now += 1))
+		const immediate = vi.spyOn(globalThis, 'setImmediate')
+		try {
+			const result = fm.decodeRecords(Buffer.concat(batches), [], 100n)
+			expect(result).toBeInstanceOf(Promise)
+			const { records } = await result
+			expect(values(records)).toEqual(['v0', 'v1', 'v2', 'v3', 'v4', 'v5'])
+			expect(immediate).toHaveBeenCalled()
+		} finally {
+			clock.mockRestore()
+			immediate.mockRestore()
+		}
 	})
 })
