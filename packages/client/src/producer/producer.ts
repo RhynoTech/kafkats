@@ -51,6 +51,20 @@ import type {
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
+// The broker rejects a record batch larger than max.message.bytes after compression with
+// MESSAGE_TOO_LARGE (default 1048588, which includes the 12-byte log overhead counted here too).
+const MAX_RECORD_BATCH_BYTES = 1_048_576
+// Each piece compresses differently from the whole, so pieces aim below the limit.
+const SPLIT_FILL_RATIO = 0.9
+
+function recordBytes(message: QueuedMessage): number {
+	let size = 20 + (message.key?.length ?? 0) + (message.value?.length ?? 0)
+	for (const value of Object.values(message.headers)) {
+		size += value.length
+	}
+	return size
+}
+
 // Producers whose transaction callback is running in the current async context.
 // Detects producer.transaction() called from inside that same producer's own
 // callback, which would otherwise deadlock on the transaction queue. Module-level
@@ -338,6 +352,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private async prepareProduceBatches(batches: PartitionBatch[]): Promise<PreparedProduceBatch[]> {
 		const preparedBatches: PreparedProduceBatch[] = []
 		for (const batch of batches) {
+			if (this.transactionAbortCause) {
+				// Records queued behind a failed record would only add data the abort discards.
+				for (const msg of batch.messages) {
+					msg.reject(this.transactionAbortCause)
+				}
+				continue
+			}
+
 			const { topic, partition, messages } = batch
 			let recordCount = messages.length
 			let messagesToSend = messages
@@ -350,25 +372,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				// Handle sequence wrap - only use reserved count
 				if (reservation.reservedCount < recordCount) {
 					messagesToSend = messages.slice(0, reservation.reservedCount)
-					// Re-queue remaining messages
-					const remainingBatch: PartitionBatch = {
-						topic,
-						partition,
-						messages: messages.slice(reservation.reservedCount),
-						sizeBytes: messages
-							.slice(reservation.reservedCount)
-							.reduce((sum, m) => sum + (m.value?.length ?? 0) + (m.key?.length ?? 0), 0),
-						createdAt: Date.now(),
-					}
-					// Prepend, not push: this remainder holds the messages that immediately
-					// follow the ones being sent now. It must drain before any later batch
-					// already queued for this partition, or per-partition order would break
-					// (the later batch would get a lower sequence than the remainder).
-					this.pendingBatches.unshift(remainingBatch)
-					// The remainder never went through flushBatch(), but its send will call
-					// batchCompleted() — account for it or the pending counter goes negative.
-					this.accumulator.batchEnqueued()
-					this.scheduleDrain()
+					this.requeueFront(topic, partition, [messages.slice(reservation.reservedCount)])
 					recordCount = reservation.reservedCount
 				}
 			}
@@ -410,6 +414,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					this.config.compression === CompressionType.None
 						? encodeRecordBatchSync(recordBatch, encodeOptions)
 						: await encodeRecordBatch(recordBatch, encodeOptions)
+				if (this.config.idempotent && !this.inflightBatches.has(batchId)) {
+					// A fence or disconnect during compression already rejected these records; sending
+					// them, or pieces of them, under the next epoch would write records reported failed.
+					continue
+				}
 
 				const encodeEnd = performance.now()
 				if (this.trace) {
@@ -421,6 +430,30 @@ export class Producer extends EventEmitter<ProducerEvents> {
 						topic,
 						partition,
 					})
+				}
+
+				if (encodedBatch.length > MAX_RECORD_BATCH_BYTES && recordCount > 1) {
+					// Nothing was sent, so the pieces reuse this batch's sequence range in order.
+					if (this.config.idempotent) {
+						this.rollbackSequence(topic, partition, recordCount)
+						this.inflightBatches.delete(batchId)
+					}
+					const sizes = messagesToSend.map(recordBytes)
+					const total = sizes.reduce((sum, size) => sum + size, 0)
+					const pieceBudget = (total * SPLIT_FILL_RATIO * MAX_RECORD_BATCH_BYTES) / encodedBatch.length
+					const pieces: QueuedMessage[][] = [[]]
+					let pieceBytes = 0
+					for (let i = 0; i < recordCount; i++) {
+						if (pieceBytes + sizes[i]! > pieceBudget && pieces[pieces.length - 1]!.length > 0) {
+							pieces.push([])
+							pieceBytes = 0
+						}
+						pieces[pieces.length - 1]!.push(messagesToSend[i]!)
+						pieceBytes += sizes[i]!
+					}
+					this.requeueFront(topic, partition, pieces.slice(1))
+					preparedBatches.push(...(await this.prepareProduceBatches([{ ...batch, messages: pieces[0]! }])))
+					continue
 				}
 
 				preparedBatches.push({
@@ -440,12 +473,28 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					this.rollbackSequence(topic, partition, recordCount)
 					this.inflightBatches.delete(batchId)
 				}
+				const failure = error instanceof Error ? error : new Error(String(error))
+				this.recordTransactionalSendFailure(failure)
 				for (const msg of messagesToSend) {
-					msg.reject(error instanceof Error ? error : new Error(String(error)))
+					msg.reject(failure)
 				}
 			}
 		}
 		return preparedBatches
+	}
+
+	/**
+	 * Queue the records that immediately follow the batch being prepared, ahead of every later
+	 * batch already queued for the partition: draining a later one first would give it a lower
+	 * sequence and break per-partition order.
+	 */
+	private requeueFront(topic: string, partition: number, pieces: QueuedMessage[][]): void {
+		for (let i = pieces.length - 1; i >= 0; i--) {
+			this.pendingBatches.unshift({ topic, partition, messages: pieces[i]!, sizeBytes: 0, createdAt: Date.now() })
+			// The piece never went through flushBatch(), but its send will call batchCompleted().
+			this.accumulator.batchEnqueued()
+		}
+		this.scheduleDrain()
 	}
 
 	private async sendPreparedBatches(preparedBatches: PreparedProduceBatch[]): Promise<void> {
@@ -732,6 +781,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private failPreparedBatch(prepared: PreparedProduceBatch, error: Error): void {
 		const { batch, recordCount, batchId, messagesToSend } = prepared
+		// Recorded now, not when the send's promise rejects, so pieces of the same send that are
+		// already queued see the doomed transaction before they are sent.
+		this.recordTransactionalSendFailure(error)
 		if (this.config.idempotent) {
 			// Safe to roll back: this path is only for definitive failures (explicit broker
 			// error code, or a pre-send encoding failure) where the sequence was not consumed.
@@ -1744,10 +1796,17 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		const abortError = new TransactionAbortedError(this.config.transactionalId!)
 		this.accumulator.clearWithRejection(abortError)
+		this.rejectAndClearPendingBatches(abortError)
 
 		// Drain in-flight sends before EndTxn(abort): a transactional ProduceRequest must
 		// not race the abort marker. Failures are expected — the sends are being aborted.
 		await Promise.allSettled(this.activeSends)
+		// A send settles on its first failed record while its other batches may still be in flight
+		// or queueing pieces, and either would otherwise reach a broker after the abort marker.
+		while (this.inflight.size > 0 || this.pendingBatches.length > 0) {
+			this.rejectAndClearPendingBatches(abortError)
+			await Promise.allSettled(this.inflight)
+		}
 
 		try {
 			// Nothing was added to the transaction: it never started broker-side, and

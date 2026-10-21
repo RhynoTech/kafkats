@@ -57,6 +57,12 @@ This design makes `send()` fast under load, but it also means you should think a
 | Size-based batching | `maxBatchBytes`                              | Flush the current batch when it reaches the size threshold      |
 | Explicit flush      | `producer.flush()` / `producer.disconnect()` | Flush all batches immediately and wait for acknowledgments      |
 
+#### Large Sends
+
+All records one `send()` puts into a partition go into one record batch. Brokers reject a batch larger than the topic's `max.message.bytes` after compression (1 MiB by default), so when a partition's batch encodes to more than 1,048,576 bytes the producer cuts it into several batches and sends them one after another, in order. Inside a transaction every piece belongs to the same transaction. Outside a transaction the pieces are separate appends, so a failure can leave the earlier pieces written.
+
+A single record is never cut: it is sent as is, and the broker decides whether the topic accepts it. Topics whose `max.message.bytes` is below 1 MiB still reject batches between their limit and 1 MiB with `MessageTooLarge`.
+
 ::: tip Fire-and-forget
 You can call `producer.send(...)` without awaiting it, but you must eventually call `await producer.flush()` or `await producer.disconnect()` (or keep the process alive) to ensure queued records are actually delivered.
 :::
