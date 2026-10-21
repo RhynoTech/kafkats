@@ -64,9 +64,10 @@ await consumer.runBatch('events', async (messages, ctx) => {
 Each batch holds records from one partition, up to the consumer's `maxBytesPerPartition` (estimated from key and
 value sizes). Records fetched ahead while a handler is busy stay buffered for the next batch, so a slow handler never
 receives more than one partition's byte budget at once. A record larger than the limit is delivered on its own.
-Buffered records stay as fetched, compressed, and are decoded only when delivered: the consumer holds up to 10 ×
-`maxBytesPerPartition` of fetched bytes, plus at most one decompressed batch per partition that a delivery stopped
-inside.
+Buffered records stay as fetched, compressed, until shortly before they are delivered: the records next in line, about
+one `maxBytesPerPartition` budget, are decoded in the background while handlers run. The consumer holds up to 10 ×
+`maxBytesPerPartition` of fetched bytes, counting those decoded records and at most one decompressed batch per
+partition that decoding stopped inside.
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 

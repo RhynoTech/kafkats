@@ -122,9 +122,14 @@ export function readFetchedRecords(
 	})()
 }
 
+/** Estimated in-memory size of a decoded record; drives the per-partition batch cap and the poll budget. */
+export function recordBytes(record: DecodedRecord): number {
+	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
+}
+
 /**
- * A partition's fetched batches, decoded one batch at a time as records are drained. A drain that
- * stops inside a batch keeps the decoded batch for the next one.
+ * A partition's fetched batches, decoded one batch at a time as records are drained. Records can be
+ * decoded ahead of the drain; they stay here, counted, until it consumes them.
  */
 export class CompletedFetch {
 	/** Set when the buffer discards this fetch, so a drain awaiting decompression drops what it read. */
@@ -132,13 +137,20 @@ export class CompletedFetch {
 	/** The offset to fetch again from to get back every record not yet delivered. */
 	position: bigint
 	private consumedPosition: bigint
-	private remaining: number
+	private undecoded: number
 	private readonly data: Buffer
 	private readonly batches: FetchedBatch[]
 	private readonly fetchOffset: bigint
 	private nextBatch = 0
 	private reader: BatchReader | null = null
-	private peeked: DecodedRecord | null = null
+	/** Records decoded but not yet consumed, at [head, tail). The array is reused, never trimmed. */
+	private readonly decoded: Array<DecodedRecord | undefined> = []
+	private head = 0
+	private tail = 0
+	private decodedBytes = 0
+	/** A batch being decompressed; decoding waits for it so records stay in order. */
+	private opening: Promise<void> | null = null
+	private failure: { error: unknown } | null = null
 
 	constructor(
 		readonly topic: string,
@@ -149,61 +161,111 @@ export class CompletedFetch {
 		this.data = records.data
 		this.batches = records.batches
 		this.fetchOffset = records.fetchOffset
-		this.remaining = records.recordCount
+		this.undecoded = records.recordCount
 		this.position = records.fetchOffset
 		this.consumedPosition = records.fetchOffset
 	}
 
-	/** Bytes this fetch keeps alive: its batches as fetched, plus a batch decompressed for a drain. */
+	/**
+	 * Bytes this fetch keeps alive: its batches as fetched, a batch decompressed for decoding, and
+	 * the records decoded but not yet consumed at their estimated size.
+	 */
 	get heldBytes(): number {
-		return this.data.length + (this.reader?.decompressedBytes ?? 0)
+		return this.data.length + (this.reader?.decompressedBytes ?? 0) + this.decodedBytes
 	}
 
 	get isEmpty(): boolean {
-		return this.remaining === 0
+		return this.undecoded === 0 && this.head === this.tail
 	}
 
 	/** The next deliverable record, without consuming it; null once every record was consumed. */
 	peek(): DecodedRecord | null | Promise<DecodedRecord | null> {
-		while (this.peeked === null) {
-			if (this.remaining === 0) return null
-			const reader = this.reader
-			if (reader !== null) {
-				const record = reader.next()
-				if (record === null) this.reader = null
-				else if (reader.batch.allVisible || isVisible(record.offset, this.fetchOffset, reader.batch.aborted)) {
-					this.peeked = record
-				}
-				continue
-			}
-			const batch = this.batches[this.nextBatch++]
-			if (batch === undefined) {
-				this.remaining = 0
-				return null
-			}
-			const opened = openBatch(this.data, batch)
-			if (opened instanceof Promise) {
-				return opened.then(reader => {
-					this.reader = reader
-					return this.peek()
-				})
-			}
-			this.reader = opened
+		const record = this.ahead(0)
+		return record instanceof Promise ? record.then(() => this.peek()) : record
+	}
+
+	/**
+	 * The record `index` places after the next one, decoding up to it; null if fewer are left. While
+	 * a batch is being decompressed it returns a promise to wait on before asking again.
+	 */
+	ahead(index: number): DecodedRecord | null | Promise<void> {
+		while (this.head + index >= this.tail) {
+			const decoded = this.decodeNext()
+			if (decoded === false) return null
+			if (decoded !== true) return decoded
 		}
-		return this.peeked
+		return this.decoded[this.head + index]!
 	}
 
 	/** Consume the record peek() returned. */
 	consume(): void {
-		this.consumedPosition = this.peeked!.offset + 1n
-		this.peeked = null
-		this.remaining--
-		if (this.remaining === 0) this.reader = null
+		const record = this.decoded[this.head]!
+		this.consumedPosition = record.offset + 1n
+		this.decodedBytes -= recordBytes(record)
+		// Consumed records belong to the handler now; holding them would pin their buffers.
+		this.decoded[this.head++] = undefined
+		if (this.head === this.tail) {
+			this.head = 0
+			this.tail = 0
+		}
 	}
 
 	/** Mark consumed records delivered, so a pause no longer rewinds to them. */
 	commit(): void {
 		this.position = this.consumedPosition
+	}
+
+	/** Decode the next deliverable record; false once all are decoded. A failure is kept and rethrown. */
+	private decodeNext(): boolean | Promise<void> {
+		if (this.opening) return this.opening
+		if (this.failure) throw this.failure.error
+		try {
+			while (this.undecoded > 0) {
+				const reader = this.reader
+				if (reader === null) {
+					const batch = this.batches[this.nextBatch++]
+					if (batch === undefined) break
+					const opened = openBatch(this.data, batch)
+					if (opened instanceof Promise) return this.open(opened)
+					this.reader = opened
+					continue
+				}
+				const record = reader.next()
+				if (record === null) {
+					this.reader = null
+				} else if (
+					reader.batch.allVisible ||
+					isVisible(record.offset, this.fetchOffset, reader.batch.aborted)
+				) {
+					this.decoded[this.tail++] = record
+					this.decodedBytes += recordBytes(record)
+					if (--this.undecoded === 0) this.reader = null
+					return true
+				}
+			}
+		} catch (error) {
+			this.failure = { error }
+			throw error
+		}
+		this.undecoded = 0
+		return false
+	}
+
+	private open(opened: Promise<BatchReader>): Promise<void> {
+		this.opening = opened
+			.then(
+				reader => {
+					this.reader = reader
+				},
+				(error: unknown) => {
+					this.failure = { error }
+					throw error
+				}
+			)
+			.finally(() => {
+				this.opening = null
+			})
+		return this.opening
 	}
 }
 

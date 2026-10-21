@@ -73,6 +73,14 @@ function gzipBatch(offsets: bigint[]): Promise<Buffer> {
 	)
 }
 
+/** A gzip batch of records estimated at 100 bytes each, at consecutive offsets from `first`. */
+function gzipBatchOf(first: bigint, count: number): Promise<Buffer> {
+	const records = Array.from({ length: count }, () => ({ value: Buffer.alloc(36), timestamp: 0 }))
+	return encodeRecordBatch(createRecordBatch(records, first, 0n), { compression: CompressionType.Gzip })
+}
+
+const offsetRange = (first: bigint, count: number) => Array.from({ length: count }, (_, index) => first + BigInt(index))
+
 /** Corrupt a compressed batch's payload but keep its CRC valid, so only decompression can fail. */
 function corruptPayload(encoded: Buffer): Buffer {
 	const copy = Buffer.from(encoded)
@@ -118,6 +126,31 @@ describe('FetchManager lazy decoding', () => {
 		expect(state.offset).toBe(2n)
 		expect(state.fetchEpoch).toBe(epoch + 1)
 		await expect(fm.poll()).rejects.toThrow(/corrupt data.*t-0 at offset 2/)
+		fm.stop()
+	})
+
+	it('decodes what the next poll takes in the background, so the poll path does not decompress', async () => {
+		const decompress = vi.spyOn(gzipCodec, 'decompress')
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		const batches: Buffer[] = []
+		for (let first = 0n; first < 30n; first += 5n) batches.push(await gzipBatchOf(first, 5))
+		await deliver(fmAny, { 0: Buffer.concat(batches) })
+
+		// A 1024-byte poll takes ten records and looks at the eleventh, so it needs three batches.
+		await vi.waitFor(() => expect(decompress).toHaveBeenCalledTimes(3))
+		expect(offsetsOf(await fm.poll())).toEqual(offsetRange(0n, 10))
+		expect(decompress).toHaveBeenCalledTimes(3)
+
+		// Once the poll returns, the next poll's records are decoded while its caller works.
+		await vi.waitFor(() => expect(decompress).toHaveBeenCalledTimes(5))
+		await new Promise(resolve => setTimeout(resolve, 20))
+		expect(decompress).toHaveBeenCalledTimes(5)
+		const [fetch] = fmAny.fetchBuffer.queue
+		expect(fmAny.fetchBuffer.sizeBytes).toBeGreaterThanOrEqual(fetch.data.length + 11 * 100)
+
+		expect(offsetsOf(await fm.poll())).toEqual(offsetRange(10n, 10))
+		expect(decompress).toHaveBeenCalledTimes(5)
 		fm.stop()
 	})
 

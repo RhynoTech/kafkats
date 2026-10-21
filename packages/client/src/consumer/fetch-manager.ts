@@ -18,12 +18,7 @@ import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
-import { CompletedFetch, readFetchedRecords, type FetchedRecords } from './completed-fetch.js'
-
-/** Estimated in-memory size of a decoded record; drives the per-partition batch cap and the poll budget. */
-function recordBytes(record: DecodedRecord): number {
-	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
-}
+import { CompletedFetch, readFetchedRecords, recordBytes, type FetchedRecords } from './completed-fetch.js'
 
 function corruptDataError(topic: string, partition: number, offset: bigint, cause: unknown): Error {
 	const message = cause instanceof Error ? cause.message : String(cause)
@@ -50,20 +45,27 @@ type PartitionKeys = Pick<ReadonlySet<string>, 'has'>
 
 /**
  * Buffer for completed fetches with memory bounding and wait/signal. It counts the bytes it holds:
- * record batches as fetched, compressed ones at their compressed size, plus any batch a drain left
- * decompressed part-way through.
+ * record batches as fetched, compressed ones at their compressed size, plus any batch left
+ * decompressed part-way through and the records decoded ahead of a drain.
  */
 class FetchBuffer {
 	private queue: CompletedFetch[] = []
-	private bufferedBytes = 0
 	private reservedBytes = 0
 	private waiters: Array<(force?: boolean) => void> = []
 	private capacityWaiter: (() => void) | null = null
+	private draining = false
+	private stageRun = 0
 
-	constructor(readonly maxBytes: number) {}
+	constructor(
+		readonly maxBytes: number,
+		private readonly onAdd: () => void = () => {}
+	) {}
 
+	/** Summed on demand: decoding ahead grows a fetch's bytes outside any buffer call. */
 	get sizeBytes(): number {
-		return this.bufferedBytes
+		let bytes = 0
+		for (const fetch of this.queue) bytes += fetch.heldBytes
+		return bytes
 	}
 
 	/**
@@ -71,17 +73,17 @@ class FetchBuffer {
 	 */
 	add(fetch: CompletedFetch): void {
 		this.queue.push(fetch)
-		this.bufferedBytes += fetch.heldBytes
 		this.signalWaiters()
+		this.onAdd()
 	}
 
 	/**
 	 * Drain one batch per partition and assignment epoch, coalescing that partition's buffered
-	 * fetches up to `maxBytesPerPartition` estimated bytes and decoding only the records it takes.
-	 * Each batch takes at least one record so an oversized record still makes progress. Planned
-	 * partitions go first, in plan order and capped per entry, then the remaining partitions FIFO. A
-	 * poll stops starting partitions once it has used `maxBytesPerPartition` of budget; served
-	 * partitions rotate behind the others for the next poll.
+	 * fetches up to `maxBytesPerPartition` estimated bytes and decoding the records it takes that
+	 * stage() has not already decoded. Each batch takes at least one record so an oversized record
+	 * still makes progress. Planned partitions go first, in plan order and capped per entry, then the
+	 * remaining partitions FIFO. A poll stops starting partitions once it has used
+	 * `maxBytesPerPartition` of budget; served partitions rotate behind the others for the next poll.
 	 *
 	 * A partition discarded (paused, seeked, revoked) while the drain awaits decompression is left
 	 * out of the result. A partition whose data fails to decode returns the records before the bad
@@ -92,23 +94,11 @@ class FetchBuffer {
 		excludedPartitions?: PartitionKeys,
 		plan: ScheduleDecision['drain'] = []
 	): Promise<{ batches: PartitionBatch[]; failures: DrainFailure[] }> {
-		const byPartition = new Map<string, CompletedFetch[]>()
-		for (const fetch of this.queue) {
-			const key = tpKey(fetch.topic, fetch.partition)
-			if (excludedPartitions?.has(key)) continue
-			const entries = byPartition.get(key)
-			if (entries) entries.push(fetch)
-			else byPartition.set(key, [fetch])
-		}
-
+		const byPartition = this.byPartition(excludedPartitions)
 		const drained = new Map<string, PartitionBatch>()
-		const served = new Set<string>()
 		const failures: DrainFailure[] = []
-		// Bytes charged against the poll budget. A partition is charged at most its own allowance, so
-		// an oversized first record cannot crowd out the partitions planned after it.
-		let budgetUsed = 0
 
-		const take = async (partitionKey: string, maxBytes: number): Promise<void> => {
+		const take = async (partitionKey: string, maxBytes: number): Promise<number> => {
 			let takenBytes = 0
 			for (const fetch of byPartition.get(partitionKey)!) {
 				const key = `${partitionKey}\0${fetch.assignmentEpoch}`
@@ -143,20 +133,16 @@ class FetchBuffer {
 				}
 				if (full) break
 			}
-			served.add(partitionKey)
-			budgetUsed += Math.min(takenBytes, maxBytes)
+			return takenBytes
 		}
 
-		for (const entry of plan) {
-			if (budgetUsed >= maxBytesPerPartition) break
-			const partitionKey = tpKey(entry.topic, entry.partition)
-			if (served.has(partitionKey) || !byPartition.has(partitionKey)) continue
-			const maxBytes = Math.min(entry.maxBytes, maxBytesPerPartition)
-			await take(partitionKey, maxBytes > 0 ? maxBytes : 0)
-		}
-		for (const partitionKey of byPartition.keys()) {
-			if (budgetUsed >= maxBytesPerPartition) break
-			if (!served.has(partitionKey)) await take(partitionKey, maxBytesPerPartition)
+		this.draining = true
+		this.stageRun++
+		let served: Set<string>
+		try {
+			served = await this.walk(byPartition, maxBytesPerPartition, plan, take)
+		} finally {
+			this.draining = false
 		}
 
 		const kept = (partitionKey: string) => !byPartition.get(partitionKey)!.some(fetch => fetch.dropped)
@@ -176,8 +162,95 @@ class FetchBuffer {
 			target.push(fetch)
 		}
 		this.queue = [...untouched, ...rotated]
-		this.recount()
+		this.signalCapacityWaiter()
 		return { batches, failures: failures.filter(failure => !failure.fetch.dropped) }
+	}
+
+	/**
+	 * Decode ahead the records the next drain will look at, walking partitions as a drain with no
+	 * partition excluded would, so decompression and parsing overlap the handlers instead of adding
+	 * to the next poll. The records stay buffered, and counted, until a drain takes them. A drain, a
+	 * newer stage, or a fetch leaving the buffer stops the walk at its next await. A record that fails
+	 * to decode stops the walk for its partition; the drain raises it after the records before it.
+	 */
+	async stage(maxBytesPerPartition: number, plan: ScheduleDecision['drain'] = []): Promise<void> {
+		if (this.draining) return
+		const run = ++this.stageRun
+		const byPartition = this.byPartition()
+		const decodeAhead = async (partitionKey: string, maxBytes: number): Promise<number | null> => {
+			let takenBytes = 0
+			for (const fetch of byPartition.get(partitionKey)!) {
+				for (let index = 0; ;) {
+					let record: DecodedRecord | null | Promise<void>
+					try {
+						record = fetch.ahead(index)
+						if (record instanceof Promise) await record
+					} catch {
+						return run === this.stageRun ? takenBytes : null
+					}
+					if (record instanceof Promise) {
+						if (run !== this.stageRun || fetch.dropped) return null
+						continue
+					}
+					if (record === null) break
+					const size = recordBytes(record)
+					if (takenBytes > 0 && takenBytes + size > maxBytes) return takenBytes
+					takenBytes += size
+					index++
+				}
+			}
+			return takenBytes
+		}
+		await this.walk(byPartition, maxBytesPerPartition, plan, decodeAhead)
+	}
+
+	/** Buffered fetches per partition, in queue order. */
+	private byPartition(excludedPartitions?: PartitionKeys): Map<string, CompletedFetch[]> {
+		const byPartition = new Map<string, CompletedFetch[]>()
+		for (const fetch of this.queue) {
+			const key = tpKey(fetch.topic, fetch.partition)
+			if (excludedPartitions?.has(key)) continue
+			const entries = byPartition.get(key)
+			if (entries) entries.push(fetch)
+			else byPartition.set(key, [fetch])
+		}
+		return byPartition
+	}
+
+	/**
+	 * Visit partitions in drain order until a poll's budget is used, returning those visited. `take`
+	 * returns the bytes it took from a partition, or null to end the walk.
+	 */
+	private async walk(
+		byPartition: Map<string, CompletedFetch[]>,
+		maxBytesPerPartition: number,
+		plan: ScheduleDecision['drain'],
+		take: (partitionKey: string, maxBytes: number) => Promise<number | null>
+	): Promise<Set<string>> {
+		const served = new Set<string>()
+		// Bytes charged against the poll budget. A partition is charged at most its own allowance, so
+		// an oversized first record cannot crowd out the partitions planned after it.
+		let budgetUsed = 0
+		const visit = async (partitionKey: string, maxBytes: number): Promise<boolean> => {
+			served.add(partitionKey)
+			const taken = await take(partitionKey, maxBytes)
+			if (taken === null) return false
+			budgetUsed += Math.min(taken, maxBytes)
+			return true
+		}
+
+		for (const entry of plan) {
+			if (budgetUsed >= maxBytesPerPartition) return served
+			const partitionKey = tpKey(entry.topic, entry.partition)
+			if (served.has(partitionKey) || !byPartition.has(partitionKey)) continue
+			const maxBytes = Math.min(entry.maxBytes, maxBytesPerPartition)
+			if (!(await visit(partitionKey, maxBytes > 0 ? maxBytes : 0))) return served
+		}
+		for (const partitionKey of byPartition.keys()) {
+			if (budgetUsed >= maxBytesPerPartition) return served
+			if (!served.has(partitionKey) && !(await visit(partitionKey, maxBytesPerPartition))) return served
+		}
+		return served
 	}
 
 	/** Aggregate buffered bytes per partition, in queue (first-seen) order. */
@@ -201,7 +274,7 @@ class FetchBuffer {
 	}
 
 	remainingCapacity(): number {
-		return Math.max(0, this.maxBytes - this.bufferedBytes - this.reservedBytes)
+		return Math.max(0, this.maxBytes - this.sizeBytes - this.reservedBytes)
 	}
 
 	/** Reserve part of the memory budget for a Fetch response before dispatching it. */
@@ -359,12 +432,6 @@ class FetchBuffer {
 			fetch.dropped = true
 			return false
 		})
-		this.recount()
-	}
-
-	private recount(): void {
-		this.bufferedBytes = 0
-		for (const fetch of this.queue) this.bufferedBytes += fetch.heldBytes
 		this.signalCapacityWaiter()
 	}
 }
@@ -398,10 +465,11 @@ export interface FetchManagerConfig {
 	/** Verify the CRC32C of each fetched batch (default true). See ConsumerConfig.checkCrcs. */
 	checkCrcs?: boolean
 	/**
-	 * Maximum bytes of fetched data to hold for poll() mode, counted exactly as held: record
-	 * batches as fetched (compressed ones at their compressed size), plus a batch a poll left
-	 * decompressed part-way through, at most one per partition. Kafka may also return one oversized
-	 * first record batch per in-flight broker request. Default: maxBytesPerPartition * 10.
+	 * Maximum bytes of fetched data to hold for poll() mode, counted as held: record batches as
+	 * fetched (compressed ones at their compressed size), a batch left decompressed part-way through
+	 * (at most one per partition), and the records decoded ahead for the next poll at their estimated
+	 * size. Kafka may also return one oversized first record batch per in-flight broker request.
+	 * Default: maxBytesPerPartition * 10.
 	 */
 	maxBufferedBytes?: number
 	/** Called whenever a fetched batch range advances the fetch position. */
@@ -451,6 +519,7 @@ export class FetchManager {
 	// Partitions currently held by handlers, as last passed to poll(). The consumer passes its live
 	// `active` map, so the background fetch loop sees current busy state when it schedules fetches.
 	private lastExcluded?: PartitionKeys
+	private stageScheduled = false
 
 	constructor(
 		cluster: Cluster,
@@ -1080,7 +1149,7 @@ export class FetchManager {
 		// Lazy initialization: start background fetch loop on first call
 		if (!this.fetchBuffer) {
 			const maxBufferedBytes = this.config.maxBufferedBytes ?? this.config.maxBytesPerPartition * 10
-			this.fetchBuffer = new FetchBuffer(maxBufferedBytes)
+			this.fetchBuffer = new FetchBuffer(maxBufferedBytes, () => this.scheduleStage())
 			this.running = true
 			this.abortController = new AbortController()
 			// Fire and forget - loop runs until stopped via running=false or abort signal
@@ -1133,7 +1202,34 @@ export class FetchManager {
 		}
 		const { batches, failures } = await fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, plan)
 		for (const { fetch, error } of failures) this.failCorruptFetch(fetch, error)
+		this.scheduleStage()
 		return batches
+	}
+
+	/**
+	 * Decode the next poll's records in the background, so decompression and parsing overlap the
+	 * handlers instead of running between them. Deferred past the current poll's continuation so its
+	 * caller starts the handlers first.
+	 */
+	private scheduleStage(): void {
+		if (this.stageScheduled) return
+		this.stageScheduled = true
+		setImmediate(() => {
+			this.stageScheduled = false
+			const fetchBuffer = this.fetchBuffer
+			if (!fetchBuffer) return
+			const { maxBytesPerPartition, priority } = this.config
+			let plan: ScheduleDecision['drain'] | undefined
+			try {
+				plan = priority?.schedule(this.buildSchedulerState(fetchBuffer)).drain
+			} catch {
+				// The same strategy runs again on the poll path, which raises its error.
+				return
+			}
+			fetchBuffer.stage(maxBytesPerPartition, plan).catch((error: unknown) => {
+				this.logger.error('decoding ahead failed', { error: (error as Error).message })
+			})
+		})
 	}
 
 	/**
