@@ -63,8 +63,8 @@ All records one `send()` puts into a partition go into one record batch, and bro
 
 - **Before encoding**, the producer estimates the compressed size from the compression ratio it has seen for the topic, so a large send is usually compressed once. The estimate starts out assuming no compression and improves slowly, as in the Java client, so the first large sends to a topic are cut into more batches than needed.
 - **After encoding**, a batch that came out larger than estimated is cut again before it is sent.
-- **If the broker still rejects a batch** as too large (a topic whose `max.message.bytes` is below `maxRecordBatchBytes`), the producer splits it in two, resends it without using a retry, and narrows down that topic's limit for later sends.
-- **A single record** that encodes larger than `maxRecordBatchBytes`, or than the topic is known to accept, fails with `RecordTooLargeError` without being sent. Raise `maxRecordBatchBytes` for topics whose `max.message.bytes` is larger.
+- **If the broker still rejects a batch** as too large (a topic whose `max.message.bytes` is below `maxRecordBatchBytes`), the producer splits it in two, resends it without using a retry, and narrows down that topic's limit for later sends. It learns the limit again five minutes after the last rejection, so a raised `max.message.bytes` takes effect.
+- **A single record** that encodes larger than `maxRecordBatchBytes` fails with `RecordTooLargeError` without being sent; one the broker rejects as too large for the topic fails with `RecordTooLargeError` too. Raise `maxRecordBatchBytes` for topics whose `max.message.bytes` is larger.
 
 ::: tip Fire-and-forget
 You can call `producer.send(...)` without awaiting it, but you must eventually call `await producer.flush()` or `await producer.disconnect()` (or keep the process alive) to ensure queued records are actually delivered.

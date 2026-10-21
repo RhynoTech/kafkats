@@ -61,6 +61,11 @@ const EMPTY_BUFFER = Buffer.alloc(0)
 
 // Once a topic's known limit is within 2% of the smallest batch it rejected, stop probing above it.
 const TOPIC_LIMIT_SEARCH_PRECISION = 0.02
+// Producers are not told when max.message.bytes is raised, and batches cut to a learned limit never
+// show a higher one, so the limit is learned again from the broker this long after its last rejection.
+const TOPIC_LIMIT_TTL_MS = 5 * 60 * 1000
+
+type TopicBatchLimit = { fits: number; rejected: number; rejectedAt: number }
 
 /** Upper bound on a record's size inside an encoded batch: its two deltas count at their widest varints. */
 function recordSizeUpperBound(message: QueuedMessage): number {
@@ -259,7 +264,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private compressionRatios = new CompressionRatioEstimator()
 	// Topics whose max.message.bytes is below maxRecordBatchBytes: the largest batch the broker
 	// accepted and the smallest it rejected as too large bound the topic's limit.
-	private topicBatchLimits = new Map<string, { fits: number; rejected: number }>()
+	private topicBatchLimits = new Map<string, TopicBatchLimit>()
 	// Pieces already cut to size. Like a closed batch in the Java client they are not cut again by
 	// estimate, which may have grown since, only by their exact encoded size.
 	private readonly cutBatches = new WeakSet<PartitionBatch>()
@@ -517,15 +522,17 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					})
 				}
 
-				if (encodedBatch.length > (recordCount === 1 ? this.recordSizeLimit(topic) : limit)) {
+				// A learned topic limit only cuts batches: the topic may accept a larger record by now, and
+				// only the broker can tell.
+				const sizeLimit = recordCount === 1 ? this.config.maxRecordBatchBytes : limit
+				if (encodedBatch.length > sizeLimit) {
 					// Nothing was sent, so the pieces reuse this batch's sequence range in order.
 					if (this.config.idempotent) {
 						this.rollbackSequence(topic, partition, recordCount)
 						this.inflightBatches.delete(batchId)
 					}
 					if (recordCount === 1) {
-						const maxSize = this.recordSizeLimit(topic)
-						const error = new RecordTooLargeError(topic, partition, encodedBatch.length, maxSize)
+						const error = new RecordTooLargeError(topic, partition, encodedBatch.length, sizeLimit)
 						this.recordTransactionalSendFailure(error)
 						messagesToSend[0]!.reject(error)
 						continue
@@ -571,7 +578,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	/** The size multi-record batches are cut to fit. */
 	private recordBatchLimit(topic: string): number {
-		const known = this.topicBatchLimits.get(topic)
+		const known = this.learnedTopicLimit(topic)
 		if (!known) {
 			return this.config.maxRecordBatchBytes
 		}
@@ -584,10 +591,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		return Math.floor((known.fits + known.rejected + RECORD_BATCH_HEADER_BYTES) / 2)
 	}
 
-	/** The largest batch a single record may encode to: anything larger is known to be rejected. */
-	private recordSizeLimit(topic: string): number {
-		const rejected = this.topicBatchLimits.get(topic)?.rejected ?? Number.POSITIVE_INFINITY
-		return Math.min(this.config.maxRecordBatchBytes, rejected - 1)
+	private learnedTopicLimit(topic: string): TopicBatchLimit | undefined {
+		const known = this.topicBatchLimits.get(topic)
+		if (known && Date.now() - known.rejectedAt > TOPIC_LIMIT_TTL_MS) {
+			this.topicBatchLimits.delete(topic)
+			return undefined
+		}
+		return known
 	}
 
 	/**
@@ -621,8 +631,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 */
 	private splitRejectedBatch(prepared: PreparedProduceBatch): void {
 		const { batch, encodedBatch, messagesToSend } = prepared
-		const known = this.topicBatchLimits.get(batch.topic) ?? { fits: 0, rejected: Number.POSITIVE_INFINITY }
+		const known = this.learnedTopicLimit(batch.topic) ?? {
+			fits: 0,
+			rejected: Number.POSITIVE_INFINITY,
+			rejectedAt: 0,
+		}
 		known.rejected = Math.min(known.rejected, encodedBatch.length)
+		known.rejectedAt = Date.now()
 		if (known.fits >= known.rejected) {
 			// The topic's limit was lowered since that batch fit.
 			known.fits = 0
@@ -635,10 +650,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			(encodedBatch.length - RECORD_BATCH_HEADER_BYTES) / sum(sizes)
 		)
 		if (messagesToSend.length === 1) {
-			const maxSize = this.recordSizeLimit(batch.topic)
 			this.failPreparedBatch(
 				prepared,
-				new RecordTooLargeError(batch.topic, batch.partition, encodedBatch.length, maxSize)
+				new RecordTooLargeError(batch.topic, batch.partition, encodedBatch.length, known.rejected - 1)
 			)
 			return
 		}
@@ -1025,7 +1039,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 
 		const known = this.topicBatchLimits.get(batch.topic)
-		if (known && encodedBatch.length < known.rejected) {
+		if (known && encodedBatch.length >= known.rejected) {
+			// The topic's limit was raised since that rejection.
+			this.topicBatchLimits.delete(batch.topic)
+		} else if (known) {
 			known.fits = Math.max(known.fits, encodedBatch.length)
 		}
 

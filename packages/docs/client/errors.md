@@ -69,7 +69,7 @@ try {
 
 ### RecordTooLargeError
 
-A single record encodes larger than `maxRecordBatchBytes`, or larger than the topic is known to accept. The record is not sent; inside a transaction, the transaction aborts:
+A single record encodes larger than `maxRecordBatchBytes`, and is not sent, or the broker rejected it as larger than the topic's `max.message.bytes`. Inside a transaction, the transaction aborts:
 
 ```typescript
 import { RecordTooLargeError } from '@kafkats/client'

@@ -64,7 +64,8 @@ export interface ProducerConfig {
 	 * larger than this fails with `RecordTooLargeError` without being sent.
 	 *
 	 * Raise it for topics whose `max.message.bytes` is larger. A topic with a lower limit needs no
-	 * setting: the producer splits the batch the broker rejects and remembers that topic's limit.
+	 * setting: the producer splits the batch the broker rejects and remembers that topic's limit for
+	 * five minutes after the last rejection.
 	 */
 	maxRecordBatchBytes?: number
 	/** Required acknowledgments (default: 'all') */

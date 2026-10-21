@@ -30,7 +30,10 @@ type SentBatch = {
 }
 
 type FakeLeaderOptions = {
-	/** Batches above this size are rejected with MESSAGE_TOO_LARGE, like a topic's max.message.bytes. */
+	/**
+	 * Batches above this size are rejected with MESSAGE_TOO_LARGE, like a topic's max.message.bytes.
+	 * Read on every batch, so a test can change it like an operator altering the topic.
+	 */
 	brokerLimit?: number
 	delayMs?: number
 	/** Error to answer the n-th partition batch with (0-based, counting every batch sent). */
@@ -39,7 +42,6 @@ type FakeLeaderOptions = {
 
 /** Broker stand-in: assigns offsets per partition and answers each partition batch like a leader would. */
 function fakeLeader(broker: MockBroker, opts: FakeLeaderOptions = {}): SentBatch[] {
-	const brokerLimit = opts.brokerLimit ?? Number.POSITIVE_INFINITY
 	const sent: SentBatch[] = []
 	const nextOffset = new Map<number, bigint>()
 	broker.produce.mockImplementation(async (request: ProduceRequest) => {
@@ -54,7 +56,7 @@ function fakeLeader(broker: MockBroker, opts: FakeLeaderOptions = {}): SentBatch
 					producerEpoch: records.readInt16BE(PRODUCER_EPOCH_OFFSET),
 					baseSequence: records.readInt32BE(BASE_SEQUENCE_OFFSET),
 					recordCount: records.readInt32BE(RECORD_COUNT_OFFSET),
-					accepted: records.length <= brokerLimit,
+					accepted: records.length <= (opts.brokerLimit ?? Number.POSITIVE_INFINITY),
 				}
 				const injected = opts.failBatch?.(sent.length, batch)
 				sent.push(batch)
@@ -471,6 +473,50 @@ describe('Producer record batch splitting', () => {
 		expect(mockBroker.endTxn).toHaveBeenCalledWith(expect.objectContaining({ committed: true }))
 		const endTxnAt = mockBroker.endTxn.mock.invocationCallOrder[0]!
 		expect(mockBroker.produce.mock.invocationCallOrder.every(at => at < endTxnAt)).toBe(true)
+	})
+
+	it('sends a single record above a learned topic limit, and forgets the limit once a larger batch fits', async () => {
+		const leader: FakeLeaderOptions = { brokerLimit: 100_000 }
+		const sent = fakeLeader(mockBroker, leader)
+		const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true })
+		await producer.send(TOPIC, messages(2, 60_000))
+		expect(sent.map(b => [b.recordCount, b.accepted])).toEqual([
+			[2, false],
+			[1, true],
+			[1, true],
+		])
+
+		// Raising max.message.bytes is the usual answer to a record too large for the topic.
+		leader.brokerLimit = LIMIT
+		sent.length = 0
+		await producer.send(TOPIC, { value: Buffer.alloc(150_000, 'x'), partition: 0 })
+		expect(sent.map(b => [b.recordCount, b.accepted])).toEqual([[1, true]])
+
+		sent.length = 0
+		await producer.send(TOPIC, messages(10, 60_000))
+		expect(sent.map(b => [b.recordCount, b.accepted])).toEqual([[10, true]])
+	})
+
+	it('learns a topic limit again five minutes after its last rejection', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		try {
+			const leader: FakeLeaderOptions = { brokerLimit: 100_000 }
+			const sent = fakeLeader(mockBroker, leader)
+			const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true })
+			await producer.send(TOPIC, messages(2, 60_000))
+
+			leader.brokerLimit = LIMIT
+			sent.length = 0
+			await producer.send(TOPIC, messages(10, 60_000))
+			expect(sent.length).toBeGreaterThan(1)
+
+			vi.setSystemTime(Date.now() + 5 * 60_000 + 1)
+			sent.length = 0
+			await producer.send(TOPIC, messages(10, 60_000))
+			expect(sent.map(b => [b.recordCount, b.accepted])).toEqual([[10, true]])
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 
 	it('fails a single record larger than the limit with RecordTooLargeError without sending it', async () => {
