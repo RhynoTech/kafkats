@@ -19,6 +19,7 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
+import type { FetchRequestTopic } from '@/protocol/messages/requests/fetch.js'
 import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
@@ -1017,29 +1018,27 @@ export class FetchManager {
 		// Epoch captured at issue time; a seek during the fetch bumps state.fetchEpoch,
 		// so the stale response is dropped instead of clobbering the new position.
 		const issuedEpochByKey = new Map<string, number>()
-		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
+		// One entry per consecutive run of a topic: the broker fills the response in request order
+		// (KIP-74), so merging a topic's partitions into one entry would undo the rotation below.
+		const topics: FetchRequestTopic[] = []
 		for (const state of partitions) {
-			if (!topicsMap.has(state.topic)) {
-				topicsMap.set(state.topic, [])
-			}
-			topicsMap.get(state.topic)!.push({ state })
 			const key = tpKey(state.topic, state.partition)
 			inflightStateByKey.set(key, state)
 			issuedEpochByKey.set(key, state.fetchEpoch)
-		}
-
-		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
-			topic,
-			topicId: '00000000-0000-0000-0000-000000000000',
-			partitions: parts.map(p => ({
-				partitionIndex: p.state.partition,
+			let entry = topics.at(-1)
+			if (entry?.topic !== state.topic) {
+				entry = { topic: state.topic, topicId: '00000000-0000-0000-0000-000000000000', partitions: [] }
+				topics.push(entry)
+			}
+			entry.partitions.push({
+				partitionIndex: state.partition,
 				currentLeaderEpoch: -1,
-				fetchOffset: p.state.offset,
+				fetchOffset: state.offset,
 				lastFetchedEpoch: -1,
 				logStartOffset: -1n,
 				partitionMaxBytes: this.config.maxBytesPerPartition,
-			})),
-		}))
+			})
+		}
 
 		const response = await broker.fetch({
 			replicaId: -1,
@@ -1092,6 +1091,12 @@ export class FetchManager {
 					const records = filterRecordsFromOffset(decoded, fetchOffset)
 
 					if (records.length > 0) {
+						// Without a fetch session the broker never reorders partitions, so a partition that just
+						// got data goes behind the others here, or the first backlogged one takes every response.
+						if (this.partitionStates.get(key) === state) {
+							this.partitionStates.delete(key)
+							this.partitionStates.set(key, state)
+						}
 						this.fetchBuffer.add({
 							topic: state.topic,
 							partition: state.partition,
