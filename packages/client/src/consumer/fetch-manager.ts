@@ -30,6 +30,9 @@ import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerS
 import { FetchSessionHandler, type FetchSessionPartition } from './fetch-session.js'
 
 const NULL_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
+// Java's reconnect.backoff.ms and reconnect.backoff.max.ms.
+const LEADER_RETRY_BACKOFF_MS = 50
+const LEADER_RETRY_BACKOFF_MAX_MS = 1000
 
 /**
  * True when the bytes at the decoder's position cannot hold the batch they declare: either the
@@ -466,6 +469,8 @@ interface PartitionState {
 	// partition epoch changed is dropped, so a seek that lands mid-flight is not
 	// clobbered by the stale response advancing the offset.
 	fetchEpoch: number
+	leaderLookupFailures: number
+	leaderRetryAt: number
 }
 
 /**
@@ -540,6 +545,7 @@ export class FetchManager {
 	// Buffered poll mode fields
 	private fetchBuffer: FetchBuffer | null = null
 	private brokerInFlight: Map<number, boolean> = new Map()
+	private leaderMetadataRefresh: Promise<void> | null = null
 	// One incremental fetch session per broker node. Requests to a node are sequential (one in flight),
 	// which the session epoch requires.
 	private readonly fetchSessions = new Map<number, { broker: Broker; handler: FetchSessionHandler }>()
@@ -597,6 +603,8 @@ export class FetchManager {
 				abortController: new AbortController(),
 				cachedLeader: null,
 				fetchEpoch: 0,
+				leaderLookupFailures: 0,
+				leaderRetryAt: 0,
 			}
 			this.partitionStates.set(key, state)
 		}
@@ -629,6 +637,8 @@ export class FetchManager {
 				abortController: new AbortController(),
 				cachedLeader: null,
 				fetchEpoch: 0,
+				leaderLookupFailures: 0,
+				leaderRetryAt: 0,
 			}
 			this.partitionStates.set(key, state)
 		}
@@ -1030,6 +1040,7 @@ export class FetchManager {
 
 		// Collect partitions needing leader lookup
 		const needsLookup: PartitionState[] = []
+		const now = Date.now()
 		for (const state of partitions) {
 			if (state.cachedLeader) {
 				const brokerId = state.cachedLeader.nodeId
@@ -1037,20 +1048,30 @@ export class FetchManager {
 					partitionsByBroker.set(brokerId, { broker: state.cachedLeader, partitions: [] })
 				}
 				partitionsByBroker.get(brokerId)!.partitions.push(state)
-			} else {
+			} else if (state.leaderRetryAt <= now) {
 				needsLookup.push(state)
 			}
 		}
 
 		// Parallel leader lookups for cache misses
 		if (needsLookup.length > 0) {
+			const failedTopics = new Set<string>()
 			const lookups = await Promise.all(
 				needsLookup.map(async state => {
 					try {
 						const leader = await this.cluster.getLeaderForPartition(state.topic, state.partition)
 						state.cachedLeader = leader
+						state.leaderLookupFailures = 0
 						return { state, leader }
 					} catch (error) {
+						state.leaderLookupFailures++
+						state.leaderRetryAt =
+							Date.now() +
+							Math.min(
+								LEADER_RETRY_BACKOFF_MS * 2 ** (state.leaderLookupFailures - 1),
+								LEADER_RETRY_BACKOFF_MAX_MS
+							)
+						failedTopics.add(state.topic)
 						this.logger.error('failed to get leader', {
 							topic: state.topic,
 							partition: state.partition,
@@ -1060,6 +1081,7 @@ export class FetchManager {
 					}
 				})
 			)
+			if (failedTopics.size > 0) this.refreshLeaderMetadata(failedTopics)
 
 			for (const result of lookups) {
 				if (!result) continue
@@ -1072,6 +1094,27 @@ export class FetchManager {
 		}
 
 		return partitionsByBroker
+	}
+
+	// After a crash the controller moves leadership seconds later, so the refresh that followed the
+	// failed Fetch can still name the dead broker, and nothing else refreshes it before the periodic
+	// refresh. Not awaited, so a slow metadata request cannot hold up fetches to the other brokers.
+	private refreshLeaderMetadata(topics: Set<string>): void {
+		if (this.leaderMetadataRefresh || !this.running) return
+		this.leaderMetadataRefresh = this.cluster
+			.refreshMetadata([...topics])
+			.then(
+				() => {},
+				(error: unknown) => {
+					this.logger.debug('metadata refresh failed', {
+						topics: [...topics],
+						error: (error as Error).message,
+					})
+				}
+			)
+			.finally(() => {
+				this.leaderMetadataRefresh = null
+			})
 	}
 
 	/**
