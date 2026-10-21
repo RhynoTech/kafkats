@@ -269,6 +269,9 @@ export interface ConsumerConfig {
 	 * delivered in one partition batch. Prefetched responses for a partition are coalesced up to this
 	 * size; the rest stays buffered for the next batch. A batch always holds at least one record, so
 	 * a record larger than this is still delivered (default: 1MB).
+	 *
+	 * The broker sizes a fetch in stored (possibly compressed) bytes, while a batch counts decoded key
+	 * and value bytes, so one fetch of compressed data can become several batches.
 	 */
 	maxBytesPerPartition?: number
 	minBytes?: number

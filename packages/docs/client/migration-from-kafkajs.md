@@ -287,7 +287,7 @@ await consumer.runEach(
 | `sessionTimeout`        | `sessionTimeoutMs`                   | Explicit `Ms` suffix                          |
 | `rebalanceTimeout`      | `rebalanceTimeoutMs`                 | Explicit `Ms` suffix                          |
 | `heartbeatInterval`     | `heartbeatIntervalMs`                | Explicit `Ms` suffix                          |
-| `maxBytesPerPartition`  | `maxBytesPerPartition`               | Same                                          |
+| `maxBytesPerPartition`  | `maxBytesPerPartition`               | Also caps each batch, in decoded bytes        |
 | `minBytes`              | `minBytes`                           | Same                                          |
 | `maxWaitTimeInMs`       | `maxWaitMs`                          | Shorter name                                  |
 | `readUncommitted: true` | `isolationLevel: 'read_uncommitted'` | More explicit                                 |
