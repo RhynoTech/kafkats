@@ -1,92 +1,244 @@
-import { describe, expect, it } from 'vitest'
+import { gunzipSync } from 'node:zlib'
+
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
-import { CompressionType } from '@/protocol/records/compression.js'
-import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/protocol/records/index.js'
-import type { DecodedRecord } from '@/protocol/records/index.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { CompressionType, gzipCodec } from '@/protocol/records/compression.js'
+import { createRecordBatch, encodeRecordBatch } from '@/protocol/records/index.js'
+import { crc32c } from '@/utils/crc32c.js'
+import { encodeBatch } from './helpers/completed-fetch.js'
 
-function makeFetchManager() {
+const broker = { nodeId: 1 }
+
+async function makeFetchManager() {
 	const cluster = {
-		getLeaderForPartition: () => undefined,
+		getLeaderForPartition: vi.fn().mockRejectedValue(new Error('no broker in unit test')),
 		getLogger: () => null,
 	}
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const offsetManager = new OffsetManager(cluster as any, 'g1')
-	const fm = new FetchManager(
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		cluster as any,
-		offsetManager,
-		'earliest',
-		{
-			maxBytesPerPartition: 1024,
-			minBytes: 1,
-			maxWaitMs: 50,
-			partitionConcurrency: 1,
-			isolationLevel: 'read_uncommitted',
-		}
-	)
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	return fm as any
+	const fm = new FetchManager(cluster as any, offsetManager, 'earliest', {
+		maxBytesPerPartition: 1024,
+		minBytes: 1,
+		maxWaitMs: 20,
+		partitionConcurrency: 1,
+		isolationLevel: 'read_uncommitted',
+	})
+	// Create the buffer before any partition is assigned, so the background loop stays idle.
+	await fm.poll()
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const fmAny = fm as any
+	return { fm, fmAny }
 }
 
-describe('FetchManager.decodeRecords corruption handling', () => {
-	it('throws on a corrupt leading batch instead of silently dropping the partition records', () => {
-		const fm = makeFetchManager()
-		// Too short to even read a record-batch header → the first batch fails to decode.
-		// The broker always returns at least one complete batch, so this is genuine
-		// corruption, not a truncated trailing batch.
-		const corrupt = Buffer.from([1, 2, 3, 4, 5])
-		expect(() => fm.decodeRecords(corrupt, [], 100n)).toThrow(/corrupt data/)
+/** Respond to one fetch with the given records data per partition of topic `t`. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function deliver(fmAny: any, data: Record<number, Buffer>): Promise<void> {
+	const partitions = Object.keys(data).map(Number)
+	const states = partitions.map(partition => fmAny.partitionStates.get(`t:${partition}`))
+	const fetch = vi.fn().mockResolvedValue({
+		topics: [
+			{
+				topic: 't',
+				partitions: partitions.map(partition => ({
+					partitionIndex: partition,
+					errorCode: ErrorCode.None,
+					highWatermark: 100n,
+					lastStableOffset: 100n,
+					logStartOffset: 0n,
+					abortedTransactions: [],
+					preferredReadReplica: -1,
+					recordsData: data[partition],
+				})),
+			},
+		],
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		sessionId: 0,
+	})
+	await fmAny.fetchFromBrokerToBuffer({ ...broker, fetch }, states, 1048576)
+}
+
+function gzipBatch(offsets: bigint[]): Promise<Buffer> {
+	return encodeRecordBatch(
+		createRecordBatch(
+			offsets.map(offset => ({ value: `v${offset}`, timestamp: 0 })),
+			offsets[0]!,
+			0n
+		),
+		{ compression: CompressionType.Gzip }
+	)
+}
+
+/** A gzip batch of records estimated at 100 bytes each, at consecutive offsets from `first`. */
+function gzipBatchOf(first: bigint, count: number): Promise<Buffer> {
+	const records = Array.from({ length: count }, () => ({ value: Buffer.alloc(36), timestamp: 0 }))
+	return encodeRecordBatch(createRecordBatch(records, first, 0n), { compression: CompressionType.Gzip })
+}
+
+const offsetRange = (first: bigint, count: number) => Array.from({ length: count }, (_, index) => first + BigInt(index))
+
+/** Corrupt a compressed batch's payload but keep its CRC valid, so only decompression can fail. */
+function corruptPayload(encoded: Buffer): Buffer {
+	const copy = Buffer.from(encoded)
+	copy.fill(0xff, 61 + 10, copy.length)
+	copy.writeUInt32BE(crc32c(copy, 21, copy.length - 21), 17)
+	return copy
+}
+
+const offsetsOf = (batches: Array<{ records: Array<{ offset: bigint }> }>) =>
+	batches.flatMap(batch => batch.records.map(record => record.offset))
+
+afterEach(() => {
+	vi.restoreAllMocks()
+})
+
+describe('FetchManager lazy decoding', () => {
+	it('surfaces corrupt data from the poll after the one reaching it, buffering the other partitions', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([
+			{ topic: 't', partition: 0, offset: 0n },
+			{ topic: 't', partition: 1, offset: 0n },
+		])
+
+		// Too short to hold a batch header: the broker always returns the first batch whole.
+		await deliver(fmAny, { 0: Buffer.from([1, 2, 3, 4, 5]), 1: encodeBatch([0n, 1n]) })
+		expect(fmAny.partitionStates.get('t:0').offset).toBe(0n)
+		expect(fmAny.partitionStates.get('t:1').offset).toBe(2n)
+
+		expect(offsetsOf(await fm.poll())).toEqual([0n, 1n])
+		await expect(fm.poll()).rejects.toThrow(/corrupt data.*t-0 at offset 0/)
+		fm.stop()
 	})
 
-	it('stops at a truncated trailing batch but returns the records decoded before it', () => {
-		const fm = makeFetchManager()
-		const valid = encodeRecordBatchSync(createRecordBatch([{ value: 'hello', timestamp: 0 }], 0n, 0n))
-		// One complete batch followed by a truncated second batch (header underflows).
-		const buf = Buffer.concat([valid, valid.subarray(0, 6)])
+	it('delivers the records before a batch that fails to decode, then surfaces it and rewinds to it', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		await deliver(fmAny, { 0: Buffer.concat([encodeBatch([0n, 1n]), corruptPayload(await gzipBatch([2n, 3n]))]) })
+		const state = fmAny.partitionStates.get('t:0')
+		expect(state.offset).toBe(4n)
+		const epoch = state.fetchEpoch
 
-		const result = fm.decodeRecords(buf, [], 100n) as
-			| { records: DecodedRecord[]; nextOffset: bigint | null }
-			| Promise<{ records: DecodedRecord[]; nextOffset: bigint | null }>
-		expect(result).not.toBeInstanceOf(Promise)
-		const { records } = result as { records: DecodedRecord[]; nextOffset: bigint | null }
-		expect(records.map(r => r.value?.toString('utf-8'))).toEqual(['hello'])
+		expect(offsetsOf(await fm.poll())).toEqual([0n, 1n])
+		expect(state.offset).toBe(2n)
+		expect(state.fetchEpoch).toBe(epoch + 1)
+		await expect(fm.poll()).rejects.toThrow(/corrupt data.*t-0 at offset 2/)
+		fm.stop()
 	})
 
-	it('throws on a complete-but-corrupt non-first batch instead of treating it as truncation', () => {
-		const fm = makeFetchManager()
-		const first = encodeRecordBatchSync(createRecordBatch([{ value: 'hello', timestamp: 0 }], 0n, 0n))
-		const second = encodeRecordBatchSync(createRecordBatch([{ value: 'world', timestamp: 0 }], 1n, 0n))
-		// Flip a byte inside the second batch's CRC-covered region: the batch is fully
-		// present (framing intact), so this is corruption, not maxBytes truncation.
-		second.writeUInt8(second.readUInt8(second.length - 1) ^ 0xff, second.length - 1)
-		const buf = Buffer.concat([first, second])
+	it('decodes what the next poll takes in the background, so the poll path does not decompress', async () => {
+		const decompress = vi.spyOn(gzipCodec, 'decompress')
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		const batches: Buffer[] = []
+		for (let first = 0n; first < 30n; first += 5n) batches.push(await gzipBatchOf(first, 5))
+		await deliver(fmAny, { 0: Buffer.concat(batches) })
 
-		expect(() => fm.decodeRecords(buf, [], 100n)).toThrow(/corrupt data/)
+		// A 1024-byte poll takes ten records and looks at the eleventh, so it needs three batches.
+		await vi.waitFor(() => expect(decompress).toHaveBeenCalledTimes(3))
+		expect(offsetsOf(await fm.poll())).toEqual(offsetRange(0n, 10))
+		expect(decompress).toHaveBeenCalledTimes(3)
+
+		// Once the poll returns, the next poll's records are decoded while its caller works.
+		await vi.waitFor(() => expect(decompress).toHaveBeenCalledTimes(5))
+		await new Promise(resolve => setTimeout(resolve, 20))
+		expect(decompress).toHaveBeenCalledTimes(5)
+		const [fetch] = fmAny.fetchBuffer.queue
+		expect(fmAny.fetchBuffer.sizeBytes).toBeGreaterThanOrEqual(fetch.data.length + 11 * 100)
+
+		expect(offsetsOf(await fm.poll())).toEqual(offsetRange(10n, 10))
+		expect(decompress).toHaveBeenCalledTimes(5)
+		fm.stop()
 	})
 
-	it('throws on a complete-but-corrupt non-first batch on the async (compressed) path', async () => {
-		const fm = makeFetchManager()
-		const first = await encodeRecordBatch(createRecordBatch([{ value: 'hello', timestamp: 0 }], 0n, 0n), {
-			compression: CompressionType.Gzip,
+	it('never decodes data dropped by pause, seek or revoke', async () => {
+		const decompress = vi.spyOn(gzipCodec, 'decompress')
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([0, 1, 2].map(partition => ({ topic: 't', partition, offset: 0n })))
+		await deliver(fmAny, { 0: await gzipBatch([0n, 1n]), 1: await gzipBatch([0n, 1n]), 2: await gzipBatch([0n]) })
+		expect(fmAny.fetchBuffer.sizeBytes).toBeGreaterThan(0)
+
+		fm.pausePartitions([{ topic: 't', partition: 0 }])
+		fm.seekPartition('t', 1, 0n)
+		fm.removePartitions([{ topic: 't', partition: 2 }])
+
+		expect(fmAny.fetchBuffer.sizeBytes).toBe(0)
+		expect(await fm.poll()).toEqual([])
+		expect(decompress).not.toHaveBeenCalled()
+		fm.stop()
+	})
+
+	it('drops a partition paused while a drain awaits decompression, rewinding to the records it took', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>(resolve => {
+			release = resolve
 		})
-		const second = encodeRecordBatchSync(createRecordBatch([{ value: 'world', timestamp: 0 }], 1n, 0n))
-		second.writeUInt8(second.readUInt8(second.length - 1) ^ 0xff, second.length - 1)
-		const buf = Buffer.concat([first, second])
+		vi.spyOn(gzipCodec, 'decompress').mockImplementation(async data => {
+			await gate
+			return gunzipSync(data)
+		})
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([
+			{ topic: 't', partition: 0, offset: 0n },
+			{ topic: 't', partition: 1, offset: 0n },
+		])
+		await deliver(fmAny, { 0: Buffer.concat([encodeBatch([0n]), await gzipBatch([1n, 2n])]), 1: encodeBatch([5n]) })
+		const state = fmAny.partitionStates.get('t:0')
+		expect(state.offset).toBe(3n)
 
-		await expect(async () => fm.decodeRecords(buf, [], 100n)).rejects.toThrow(/corrupt data/)
+		const polling = fm.poll()
+		// The drain has taken offset 0 and waits on the compressed batch behind it.
+		await new Promise(resolve => setTimeout(resolve, 5))
+		fm.pausePartitions([{ topic: 't', partition: 0 }])
+		expect(state.offset).toBe(0n)
+		release()
+
+		const batches = await polling
+		expect(batches.map(batch => batch.partition)).toEqual([1])
+		expect(offsetsOf(batches)).toEqual([5n])
+		fm.stop()
 	})
 
-	it('still tolerates a truncated trailing batch on the async (compressed) path', async () => {
-		const fm = makeFetchManager()
-		const first = await encodeRecordBatch(createRecordBatch([{ value: 'hello', timestamp: 0 }], 0n, 0n), {
-			compression: CompressionType.Gzip,
+	it.each([
+		['sought', (fm: FetchManager) => fm.seekPartition('t', 0, 0n)],
+		['revoked', (fm: FetchManager) => fm.removePartitions([{ topic: 't', partition: 0 }])],
+	])('drops a partition %s while a drain awaits its decompression', async (_action, act) => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>(resolve => {
+			release = resolve
 		})
-		const second = encodeRecordBatchSync(createRecordBatch([{ value: 'world', timestamp: 0 }], 1n, 0n))
-		const buf = Buffer.concat([first, second.subarray(0, second.length - 4)])
+		vi.spyOn(gzipCodec, 'decompress').mockImplementation(async data => {
+			await gate
+			return gunzipSync(data)
+		})
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		await deliver(fmAny, { 0: Buffer.concat([encodeBatch([0n]), await gzipBatch([1n, 2n])]) })
 
-		const { records } = await fm.decodeRecords(buf, [], 100n)
-		expect(records.map((r: DecodedRecord) => r.value?.toString('utf-8'))).toEqual(['hello'])
+		const polling = fm.poll()
+		await new Promise(resolve => setTimeout(resolve, 5))
+		act(fm)
+		release()
+
+		expect(await polling).toEqual([])
+		expect(fmAny.fetchBuffer.sizeBytes).toBe(0)
+		fm.stop()
+	})
+
+	it('holds a copy of the complete batches, not a view of the response', async () => {
+		const { fm, fmAny } = await makeFetchManager()
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
+		const complete = encodeBatch([0n, 1n])
+		const response = Buffer.concat([Buffer.alloc(32), complete, encodeBatch([2n]).subarray(0, 20)])
+		await deliver(fmAny, { 0: response.subarray(32) })
+
+		const [fetch] = fmAny.fetchBuffer.queue
+		expect(fetch.data.buffer).not.toBe(response.buffer)
+		expect(fetch.data).toEqual(complete)
+		expect(fmAny.fetchBuffer.sizeBytes).toBe(complete.length)
+		fm.stop()
 	})
 })

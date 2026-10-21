@@ -64,10 +64,14 @@ await consumer.runBatch('events', async (messages, ctx) => {
 Each batch holds records from one partition, up to the consumer's `maxBytesPerPartition` (estimated from key and
 value sizes). The broker sizes fetches in stored bytes, so one fetch of compressed data can become several batches.
 Records fetched ahead while a handler is busy stay buffered for the next batch, so a slow handler never receives more
-than one partition's byte budget at once. A record larger than the limit is delivered on its own. A partition whose
-fetch returned data, even only aborted or control records, moves behind the others in the next request, so backlogged
-partitions take turns instead of the first one taking every response. Low-volume partitions get handler slots too, so
-a backlog next to many of them drains more slowly than it would alone; raise `partitionConcurrency` if it must keep up.
+than one partition's byte budget at once. A record larger than the limit is delivered on its own. Buffered records
+stay as fetched, compressed, until shortly before they are delivered: the records next in line, about one
+`maxBytesPerPartition` budget, are decoded in the background while handlers run. The consumer holds up to 10 ×
+`maxBytesPerPartition` of fetched bytes, counting those decoded records and at most one decompressed batch per
+partition that decoding stopped inside. A partition whose fetch returned data, even only aborted or control records,
+moves behind the others in the next request, so backlogged partitions take turns instead of the first one taking
+every response. Low-volume partitions get handler slots too, so a backlog next to many of them drains more slowly than
+it would alone; raise `partitionConcurrency` if it must keep up.
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 
@@ -220,10 +224,14 @@ topic must continue making progress. Topics omitted from a strict order share th
 weighted shares receive a share of `1`.
 
 Custom strategies implement `PriorityStrategy` and return ordered `drain` entries, each capped at `maxBytes` out of
-the poll's `byteBudget` (the consumer's `maxBytesPerPartition`), plus the partitions currently allowed to `fetch`. Buffered partitions omitted from `drain` are still delivered FIFO after the planned entries within
-the remaining poll budget, so hold a topic back through `fetch`, not `drain`. Derive fairness from the supplied
-scheduler state: the fetch loop may call `schedule()` without a drain, and a drain decision may be only partially
-applied.
+the poll's `byteBudget` (the consumer's `maxBytesPerPartition`), plus the partitions currently allowed to `fetch`.
+`maxBytes` and `byteBudget` count the estimated decoded size of delivered records, and so does each partition's
+`deliverableBytes`, which scales batches not yet decompressed by the compression ratio last seen on that partition.
+`bufferedBytes` and `bufferCapacityBytes` count fetched bytes, compressed batches at their compressed size, so compare
+`deliverableBytes` with the budget and `bufferedBytes` with the capacity. Buffered partitions omitted from `drain` are
+still delivered FIFO after the planned entries within the remaining poll budget, so hold a topic back through
+`fetch`, not `drain`. Derive fairness from the supplied scheduler state: the fetch loop may call `schedule()` without
+a drain, and a drain decision may be only partially applied.
 
 Priority applies at poll granularity. A handler batch already admitted is never preempted; lower `maxBytesPerPartition` for
 finer-grained scheduling when `partitionConcurrency` is small. Literal topic names are checked against the

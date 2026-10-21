@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
+import { completedFetch } from './helpers/completed-fetch.js'
 
 describe('FetchManager default fast path', () => {
-	it('drains synchronously with plain buffered fetches when priority is disabled', async () => {
+	it('drains buffered fetches without building scheduler state when priority is disabled', async () => {
 		const cluster = { getLeaderForPartition: vi.fn(), getLogger: () => null }
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const offsetManager = new OffsetManager(cluster as any, 'g')
@@ -19,13 +20,12 @@ describe('FetchManager default fast path', () => {
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const internal = manager as any
-		const fetch = { topic: 'topic-a', partition: 0, records: [{ offset: 0n }], assignmentEpoch: 0 }
-		internal.fetchBuffer.add(fetch)
+		const buildSchedulerState = vi.spyOn(internal, 'buildSchedulerState')
+		internal.fetchBuffer.add(completedFetch('topic-a', 0, [0n]))
 
-		expect(Object.keys(internal.fetchBuffer.queue[0])).toEqual([...Object.keys(fetch), 'byteSize', 'nextRecord'])
-		const drained = internal.drainBuffer()
-		expect(drained).not.toBeInstanceOf(Promise)
-		expect(drained[0].records).toEqual([{ offset: 0n }])
+		const drained = await internal.drainBuffer()
+		expect(drained[0].records.map((record: { offset: bigint }) => record.offset)).toEqual([0n])
+		expect(buildSchedulerState).not.toHaveBeenCalled()
 		manager.stop()
 	})
 })

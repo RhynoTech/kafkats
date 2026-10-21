@@ -4,6 +4,7 @@ import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { createRecordBatch, encodeRecordBatchSync } from '@/protocol/records/index.js'
+import { drainAll } from './helpers/completed-fetch.js'
 
 function makeFetchManager() {
 	const broker = { nodeId: 1, fetch: vi.fn() }
@@ -122,7 +123,7 @@ describe('FetchManager position advancement past record-less batches', () => {
 		// The live record at offset 10 must be buffered (decoded with its real offset), not skipped.
 		expect(fmAny.fetchBuffer.add).toHaveBeenCalledTimes(1)
 		const buffered = fmAny.fetchBuffer.add.mock.calls[0][0]
-		expect(buffered.records.map((r: { offset: bigint }) => r.offset)).toEqual([10n])
+		expect((await drainAll(buffered)).map(r => r.offset)).toEqual([10n])
 		expect(state.offset).toBe(11n)
 		expect(onFetchPosition).toHaveBeenCalledWith({ topic: 't', partition: 0, offset: 11n }, 1)
 	})

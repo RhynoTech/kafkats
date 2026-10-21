@@ -3,33 +3,36 @@ import { describe, expect, it, vi } from 'vitest'
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { encodeBatch } from './helpers/completed-fetch.js'
 
-const FETCH_RESPONSE = {
-	topics: [
-		{
-			topic: 't',
-			partitions: [
-				{
-					partitionIndex: 0,
-					errorCode: ErrorCode.None,
-					highWatermark: 50n,
-					lastStableOffset: 50n,
-					logStartOffset: 0n,
-					abortedTransactions: null,
-					preferredReadReplica: -1,
-					recordsData: Buffer.from('non-empty'),
-				},
-			],
-		},
-	],
-	throttleTimeMs: 0,
-	errorCode: ErrorCode.None,
-	sessionId: 0,
+function responseWith(offsets: bigint[]) {
+	return {
+		topics: [
+			{
+				topic: 't',
+				partitions: [
+					{
+						partitionIndex: 0,
+						errorCode: ErrorCode.None,
+						highWatermark: 50n,
+						lastStableOffset: 50n,
+						logStartOffset: 0n,
+						abortedTransactions: null,
+						preferredReadReplica: -1,
+						recordsData: encodeBatch(offsets),
+					},
+				],
+			},
+		],
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		sessionId: 0,
+	}
 }
 
 describe('FetchManager pause with already-buffered records', () => {
 	it('rewinds the fetch offset to the earliest buffered record when a partition is paused', async () => {
-		const broker = { nodeId: 1, fetch: vi.fn().mockResolvedValue(FETCH_RESPONSE) }
+		const broker = { nodeId: 1, fetch: vi.fn().mockResolvedValue(responseWith([10n, 11n])) }
 		const cluster = {
 			getLeaderForPartition: vi.fn().mockResolvedValue(broker),
 			getLogger: () => null,
@@ -55,9 +58,9 @@ describe('FetchManager pause with already-buffered records', () => {
 
 		// Minimal in-memory stand-in for FetchBuffer that mirrors removePartitionsReturningEarliest.
 		const added: Array<{ topic: string; partition: number }> = []
-		const queue: Array<{ topic: string; partition: number; records: Array<{ offset: bigint }> }> = []
+		const queue: Array<{ topic: string; partition: number; position: bigint }> = []
 		fmAny.fetchBuffer = {
-			add: vi.fn((entry: { topic: string; partition: number; records: Array<{ offset: bigint }> }) => {
+			add: vi.fn((entry: { topic: string; partition: number; position: bigint }) => {
 				queue.push(entry)
 				added.push({ topic: entry.topic, partition: entry.partition })
 			}),
@@ -69,10 +72,8 @@ describe('FetchManager pause with already-buffered records', () => {
 					const f = queue[i]!
 					const key = `${f.topic}:${f.partition}`
 					if (!keys.has(key)) continue
-					for (const r of f.records) {
-						const cur = earliest.get(key)
-						if (cur === undefined || r.offset < cur) earliest.set(key, r.offset)
-					}
+					const cur = earliest.get(key)
+					if (cur === undefined || f.position < cur) earliest.set(key, f.position)
 					queue.splice(i, 1)
 				}
 				return earliest
@@ -81,14 +82,6 @@ describe('FetchManager pause with already-buffered records', () => {
 		}
 
 		// Records buffered at offsets 10 and 11; the fetch offset advances to 12 when buffered.
-		fmAny.decodeRecords = vi.fn().mockReturnValue({
-			records: [
-				{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-				{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-			],
-			nextOffset: 12n,
-		})
-
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
 
@@ -144,13 +137,7 @@ describe('FetchManager pause with already-buffered records', () => {
 		}
 
 		// The in-flight fetch (issued at offset 12) would return offsets 12,13.
-		fmAny.decodeRecords = vi.fn().mockReturnValue({
-			records: [
-				{ offset: 12n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-				{ offset: 13n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-			],
-			nextOffset: 14n,
-		})
+		const response = responseWith([12n, 13n])
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 12n }])
 		const state = fmAny.partitionStates.get('t:0')
@@ -165,7 +152,7 @@ describe('FetchManager pause with already-buffered records', () => {
 
 		// The pre-rewind fetch (issued at 12) now resolves. It must be fenced: if buffered, it would
 		// advance state.offset to 14 and silently drop the rewound records 10,11.
-		resolveFetch(FETCH_RESPONSE)
+		resolveFetch(response)
 		await inflight
 
 		expect(addedToBuffer).toEqual([])

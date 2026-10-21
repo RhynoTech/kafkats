@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
-import type { DecodedRecord } from '@/protocol/records/index.js'
+import { completedFetch } from './helpers/completed-fetch.js'
 
 // An eager rebalance removes and re-adds retained partitions in FetchManager. A batch
 // drained by poll() BEFORE the rebalance must not be delivered afterwards: the partition
@@ -23,10 +23,6 @@ function buildFetchManager() {
 	return fm
 }
 
-function fakeRecords(offsets: bigint[]): DecodedRecord[] {
-	return offsets.map(offset => ({ offset }) as unknown as DecodedRecord)
-}
-
 describe('FetchManager stale batch detection across eager rebalance', () => {
 	it('drops a drained batch when its partition was removed and re-added between drain and delivery', async () => {
 		const fm = buildFetchManager()
@@ -38,13 +34,7 @@ describe('FetchManager stale batch detection across eager rebalance', () => {
 
 			// Inject a completed fetch the way the background loop would buffer it.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(fm as any).fetchBuffer.add({
-				topic: 't',
-				partition: 0,
-				records: fakeRecords([0n, 1n]),
-				byteSize: 128,
-				assignmentEpoch: 0,
-			})
+			;(fm as any).fetchBuffer.add(completedFetch('t', 0, [0n, 1n]))
 
 			const batches = await fm.poll()
 			expect(batches).toHaveLength(1)
@@ -63,13 +53,9 @@ describe('FetchManager stale batch detection across eager rebalance', () => {
 
 			// A batch buffered AFTER the re-add carries the new epoch and is deliverable.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(fm as any).fetchBuffer.add({
-				topic: 't',
-				partition: 0,
-				records: fakeRecords([0n, 1n]),
-				byteSize: 128,
-				assignmentEpoch: fm.getAssignmentEpoch('t', 0),
-			})
+			;(fm as any).fetchBuffer.add(
+				completedFetch('t', 0, [0n, 1n], { assignmentEpoch: fm.getAssignmentEpoch('t', 0) })
+			)
 			const fresh = await fm.poll()
 			expect(fresh).toHaveLength(1)
 			expect(fm.isBatchAssigned(fresh[0]!)).toBe(true)
@@ -85,13 +71,7 @@ describe('FetchManager stale batch detection across eager rebalance', () => {
 			await fm.poll()
 
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(fm as any).fetchBuffer.add({
-				topic: 't',
-				partition: 0,
-				records: fakeRecords([0n]),
-				byteSize: 64,
-				assignmentEpoch: 0,
-			})
+			;(fm as any).fetchBuffer.add(completedFetch('t', 0, [0n]))
 			const batches = await fm.poll()
 			expect(batches).toHaveLength(1)
 

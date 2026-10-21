@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest'
 import { strict } from '@/consumer/priority.js'
 import type { SchedulerPartition, SchedulerState } from '@/consumer/priority.js'
 
-function partition(topic: string, partition: number, bufferedBytes: number, busy = false): SchedulerPartition {
-	return { topic, partition, bufferedBytes, busy }
+function partition(
+	topic: string,
+	partition: number,
+	bufferedBytes: number,
+	busy = false,
+	deliverableBytes = bufferedBytes
+): SchedulerPartition {
+	return { topic, partition, bufferedBytes, deliverableBytes, busy }
 }
 
 function state(partitions: SchedulerPartition[], byteBudget = 100): SchedulerState {
@@ -32,6 +38,14 @@ describe('strict topic priority', () => {
 			{ topic: 'live', partition: 0 },
 			{ topic: 'bulk', partition: 0 },
 		])
+	})
+
+	it('gates lower tiers by the deliverable bytes of higher ones, not their fetched bytes', () => {
+		// live holds 10 compressed bytes that decode to a full 100-byte budget.
+		const decision = strict({ order: ['live', 'bulk'] }).schedule(
+			state([partition('live', 0, 10, false, 100), partition('bulk', 0, 0)])
+		)
+		expect(decision.fetch).toEqual([{ topic: 'live', partition: 0 }])
 	})
 
 	it('validates its order', () => {
