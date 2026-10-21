@@ -25,7 +25,11 @@
 		"preheap:producer": "pnpm -C ../client build && pnpm build",
 		"heap:producer": "node dist/heap-producer.js",
 		"preheap:consumer": "pnpm -C ../client build && pnpm build",
-		"heap:consumer": "node dist/heap-consumer.js"
+		"heap:consumer": "node dist/heap-consumer.js",
+		"scenarios": "tsx src/scenarios/cli.ts",
+		"scenarios:matrix": "tsx src/scenarios/matrix.ts",
+		"scenarios:report": "tsx src/scenarios/report.ts",
+		"scenarios:cluster": "bash scripts/scenario-cluster.sh"
 	},
 	"engines": {
 		"node": ">=18"
