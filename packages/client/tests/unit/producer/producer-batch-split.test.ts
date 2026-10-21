@@ -692,6 +692,36 @@ describe('Producer record batch splitting', () => {
 		expect(await pendingCount(producer)).toBe(0)
 	})
 
+	it('does not resend the halves of a batch rejected as too large after a fence rejected its records', async () => {
+		useCluster(2)
+		const lowLimitLeader = createMockBroker(2)
+		mockCluster.getLeaderForPartition.mockImplementation(async (_topic, partition) =>
+			partition === 0 ? lowLimitLeader : mockBroker
+		)
+		const lowLimitSent = fakeLeader(lowLimitLeader, { brokerLimit: 2000, delayMs: 30 })
+		let outOfOrder = false
+		fakeLeader(mockBroker, { failBatch: () => (outOfOrder ? ErrorCode.OutOfOrderSequenceNumber : undefined) })
+		let epoch = 0
+		let reinitDelayMs = 0
+		mockBroker.initProducerId.mockImplementation(async () => {
+			await new Promise(resolve => setTimeout(resolve, reinitDelayMs))
+			return { throttleTimeMs: 0, errorCode: ErrorCode.None, producerId: 7n, producerEpoch: epoch++ }
+		})
+		const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true })
+		await producer.send(TOPIC, { value: Buffer.from('warm'), partition: 1 })
+
+		// Partition 1's fence starts a re-init that outlasts partition 0's MESSAGE_TOO_LARGE response.
+		outOfOrder = true
+		reinitDelayMs = 200
+		await expect(producer.send(TOPIC, [...messages(2, 1500, 0), ...messages(1, 10, 1)])).rejects.toThrow(
+			/Out of order sequence/
+		)
+		await new Promise(resolve => setTimeout(resolve, 300))
+
+		expect(lowLimitSent.map(b => [b.recordCount, b.accepted])).toEqual([[2, false]])
+		expect(await pendingCount(producer)).toBe(0)
+	})
+
 	it('drops a batch whose producer epoch was fenced while it was being compressed', async () => {
 		const restore = slowIdentityZstd(data => (data.length > 100_000 ? 50 : 0))
 		try {

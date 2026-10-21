@@ -636,6 +636,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * rejected batch's sequence range, and a split costs none of the retry budget (Java parity).
 	 */
 	private splitRejectedBatch(prepared: PreparedProduceBatch): void {
+		if (this.config.idempotent && !this.inflightBatches.has(prepared.batchId)) {
+			// A fence while this batch was in flight already rejected its records, and the epoch may not
+			// have changed yet: resending them would write records reported failed.
+			return
+		}
 		const { batch, encodedBatch, messagesToSend } = prepared
 		const known = this.learnedTopicLimit(batch.topic) ?? {
 			fits: 0,
