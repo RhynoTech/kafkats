@@ -588,6 +588,36 @@ describe('Producer record batch splitting', () => {
 		expect(await pendingCount(producer)).toBe(0)
 	})
 
+	it('outside a transaction, sends no piece queued behind a record too large to send', async () => {
+		const sent = fakeLeader(mockBroker)
+		const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true })
+
+		await expect(
+			producer.send(TOPIC, [
+				...messages(300, 3000),
+				{ value: Buffer.alloc(1_200_000, 'x'), partition: 0 },
+				...messages(300, 3000),
+			])
+		).rejects.toThrow(RecordTooLargeError)
+		await new Promise(resolve => setTimeout(resolve, 20))
+
+		expect(sent.map(b => [b.baseSequence, b.recordCount, b.accepted])).toEqual([[0, 300, true]])
+		expect(await pendingCount(producer)).toBe(0)
+		await producer.send(TOPIC, messages(1, 10))
+		expect(sent[1]).toEqual(expect.objectContaining({ baseSequence: 300, recordCount: 1, accepted: true }))
+	})
+
+	it('outside a transaction, sends no piece queued behind a piece the broker rejected', async () => {
+		const sent = fakeLeader(mockBroker, { failBatch: index => (index === 1 ? ErrorCode.InvalidRecord : undefined) })
+		const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true })
+
+		await expect(producer.send(TOPIC, sized(THREE_MIB))).rejects.toThrow(/InvalidRecord/)
+		await new Promise(resolve => setTimeout(resolve, 20))
+
+		expect(sent.map(b => b.accepted)).toEqual([true, false])
+		expect(await pendingCount(producer)).toBe(0)
+	})
+
 	it('does not send pieces queued behind a piece that fails to encode', async () => {
 		const original = compressionCodecs.get(CompressionType.Zstd)
 		let compressions = 0

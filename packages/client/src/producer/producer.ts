@@ -273,6 +273,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// Pieces already cut to size. Like a closed batch in the Java client they are not cut again by
 	// estimate, which may have grown since, only by their exact encoded size.
 	private readonly cutBatches = new WeakSet<PartitionBatch>()
+	// The pieces of a batch share the first failure of any of them. Outside a transaction, sending the
+	// pieces queued behind a failed one would write records after one the caller was told failed.
+	private readonly pieceFailures = new WeakMap<PartitionBatch, { error: Error | null }>()
 
 	// Broker-level batching: collect ready batches and group by broker
 	private pendingBatches: PartitionBatch[] = []
@@ -428,10 +431,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const preparedBatches: PreparedProduceBatch[] = []
 		const { compression } = this.config
 		for (const batch of batches) {
-			if (this.transactionAbortCause) {
-				// Records queued behind a failed record would only add data the abort discards.
+			const earlierFailure = this.transactionAbortCause ?? this.pieceFailures.get(batch)?.error
+			if (earlierFailure) {
+				// Records queued behind a failed record would only add data the abort discards, or be
+				// written after it outside a transaction.
 				for (const msg of batch.messages) {
-					msg.reject(this.transactionAbortCause)
+					msg.reject(earlierFailure)
 				}
 				continue
 			}
@@ -463,7 +468,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				if (reservation.reservedCount < recordCount) {
 					messagesToSend = messages.slice(0, reservation.reservedCount)
 					sizes = sizes.slice(0, reservation.reservedCount)
-					this.requeueFront(topic, partition, [messages.slice(reservation.reservedCount)])
+					this.requeueFront(batch, [messages.slice(reservation.reservedCount)])
 					recordCount = reservation.reservedCount
 				}
 			}
@@ -540,7 +545,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					}
 					if (recordCount === 1) {
 						const error = new RecordTooLargeError(topic, partition, encodedBatch.length, sizeLimit)
-						this.recordTransactionalSendFailure(error)
+						this.recordBatchFailure(batch, error)
 						messagesToSend[0]!.reject(error)
 						continue
 					}
@@ -551,6 +556,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					const kept = this.keepFirstPiece(batch, messagesToSend, sizes, budget, 'encoded_size')
 					const head = { ...batch, messages: messagesToSend.slice(0, kept) }
 					this.cutBatches.add(head)
+					this.pieceFailures.set(head, this.pieceFailure(batch))
 					preparedBatches.push(...(await this.prepareProduceBatches([head])))
 					continue
 				}
@@ -573,7 +579,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					this.inflightBatches.delete(batchId)
 				}
 				const failure = error instanceof Error ? error : new Error(String(error))
-				this.recordTransactionalSendFailure(failure)
+				this.recordBatchFailure(batch, failure)
 				for (const msg of messagesToSend) {
 					msg.reject(failure)
 				}
@@ -624,7 +630,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			pieces.push(messages.slice(start, start + lengths[i]!))
 			start += lengths[i]!
 		}
-		this.requeueFront(batch.topic, batch.partition, pieces)
+		this.requeueFront(batch, pieces)
 		this.traceSplit(batch, messages.length, lengths.length, reason)
 		return lengths[0]!
 	}
@@ -680,7 +686,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			recordCount: messagesToSend.length,
 			nextLimit: this.recordBatchLimit(batch.topic),
 		})
-		this.requeueFront(batch.topic, batch.partition, [messagesToSend.slice(0, cut), messagesToSend.slice(cut)])
+		this.requeueFront(batch, [messagesToSend.slice(0, cut), messagesToSend.slice(cut)])
 		this.traceSplit(batch, messagesToSend.length, 2, 'broker_rejected')
 	}
 
@@ -701,15 +707,39 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * batch already queued for the partition: draining a later one first would give it a lower
 	 * sequence and break per-partition order.
 	 */
-	private requeueFront(topic: string, partition: number, pieces: QueuedMessage[][]): void {
+	private requeueFront(batch: PartitionBatch, pieces: QueuedMessage[][]): void {
+		const { topic, partition } = batch
+		const failure = this.pieceFailure(batch)
 		for (let i = pieces.length - 1; i >= 0; i--) {
 			const piece = { topic, partition, messages: pieces[i]!, sizeBytes: 0, createdAt: Date.now() }
 			this.cutBatches.add(piece)
+			this.pieceFailures.set(piece, failure)
 			this.pendingBatches.unshift(piece)
 			// The piece never went through flushBatch(), but its send will call batchCompleted().
 			this.accumulator.batchEnqueued()
 		}
 		this.scheduleDrain()
+	}
+
+	private pieceFailure(batch: PartitionBatch): { error: Error | null } {
+		let failure = this.pieceFailures.get(batch)
+		if (!failure) {
+			failure = { error: null }
+			this.pieceFailures.set(batch, failure)
+		}
+		return failure
+	}
+
+	/**
+	 * Recorded when the records fail, not when their send's promise rejects, so pieces of the same
+	 * batch already queued see the failure, or the doomed transaction, before they are sent.
+	 */
+	private recordBatchFailure(batch: PartitionBatch, error: Error): void {
+		this.recordTransactionalSendFailure(error)
+		const failure = this.pieceFailures.get(batch)
+		if (failure) {
+			failure.error ??= error
+		}
 	}
 
 	private async sendPreparedBatches(preparedBatches: PreparedProduceBatch[]): Promise<void> {
@@ -1001,9 +1031,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private failPreparedBatch(prepared: PreparedProduceBatch, error: Error): void {
 		const { batch, recordCount, batchId, messagesToSend } = prepared
-		// Recorded now, not when the send's promise rejects, so pieces of the same send that are
-		// already queued see the doomed transaction before they are sent.
-		this.recordTransactionalSendFailure(error)
+		this.recordBatchFailure(batch, error)
 		if (this.config.idempotent) {
 			// Safe to roll back: this path is only for definitive failures (explicit broker
 			// error code, or a pre-send encoding failure) where the sequence was not consumed.
