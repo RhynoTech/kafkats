@@ -65,8 +65,8 @@ Each batch holds records from one partition, up to the consumer's `maxBytesPerPa
 value sizes). The broker sizes fetches in stored bytes, so one fetch of compressed data can become several batches.
 Records fetched ahead while a handler is busy stay buffered for the next batch, so a slow handler never receives more
 than one partition's byte budget at once. A record larger than the limit is delivered on its own. A partition whose
-fetch returned records moves behind the others in the next request, so backlogged partitions take turns instead of the
-first one taking every response.
+fetch returned data, even only aborted or control records, moves behind the others in the next request, so backlogged
+partitions take turns instead of the first one taking every response.
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 

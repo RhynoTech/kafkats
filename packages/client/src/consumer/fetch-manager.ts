@@ -1091,12 +1091,6 @@ export class FetchManager {
 					const records = filterRecordsFromOffset(decoded, fetchOffset)
 
 					if (records.length > 0) {
-						// Without a fetch session the broker never reorders partitions, so a partition that just
-						// got data goes behind the others here, or the first backlogged one takes every response.
-						if (this.partitionStates.get(key) === state) {
-							this.partitionStates.delete(key)
-							this.partitionStates.set(key, state)
-						}
 						this.fetchBuffer.add({
 							topic: state.topic,
 							partition: state.partition,
@@ -1114,6 +1108,13 @@ export class FetchManager {
 						nextOffset ?? (records.length > 0 ? records[records.length - 1]!.offset + 1n : null)
 					if (advanceTo !== null && advanceTo > state.offset) {
 						state.offset = advanceTo
+						// Without a fetch session the broker never reorders partitions, so a partition that consumed
+						// response bytes, aborted and control runs included, goes behind the others as a session
+						// would move it. Otherwise the first backlogged partition takes every response.
+						if (this.partitionStates.get(key) === state) {
+							this.partitionStates.delete(key)
+							this.partitionStates.set(key, state)
+						}
 						this.config.onFetchPosition?.(
 							{ topic: state.topic, partition: state.partition, offset: advanceTo },
 							records.length
