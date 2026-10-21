@@ -126,16 +126,61 @@ export type SnappyLib = SnappyNativeLib | SnappyJsLib
 const XERIAL_MAGIC = Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]) // \x82SNAPPY\0
 const XERIAL_HEADER_SIZE = 16
 
+// Below these sizes a synchronous native snappy call costs the event loop less than the async
+// API's threadpool round trip (35-50 µs of main-thread time per call); above them the async call
+// is cheaper. Measured with the `snappy` package on JSON records.
+const SNAPPY_SYNC_MAX_DECODED_BYTES = 64 * 1024
+const SNAPPY_SYNC_MAX_INPUT_BYTES = 32 * 1024
+// By default `snappy` hands back external buffers whose finalizers make V8 stall for 10-25 ms
+// every few hundred calls once the outputs are retained, as buffered fetches are. A copied
+// output costs about a quarter of the main-thread time per small block. Older 7.x releases
+// ignore the option.
+const SNAPPY_SYNC_OPTIONS = { asBuffer: true, copyOutputData: true } as const
+
+/** The synchronous exports of the native `snappy` package, used for small blocks when present. */
+interface SnappySyncLib {
+	compressSync: (data: Buffer, options?: typeof SNAPPY_SYNC_OPTIONS) => Buffer
+	uncompressSync: (data: Buffer, options?: typeof SNAPPY_SYNC_OPTIONS) => Buffer
+}
+
+function hasSnappySyncApi(lib: SnappyLib): lib is SnappyNativeLib & SnappySyncLib {
+	const candidate = lib as Partial<SnappySyncLib>
+	return typeof candidate.compressSync === 'function' && typeof candidate.uncompressSync === 'function'
+}
+
+/** The decoded length from a raw snappy block's varint preamble, or Infinity if it is unreadable. */
+function snappyDecodedLength(block: Buffer): number {
+	let length = 0
+	for (let i = 0; i < 5 && i < block.length; i++) {
+		const byte = block[i]!
+		length += (byte & 0x7f) * 2 ** (7 * i)
+		if ((byte & 0x80) === 0) {
+			return length
+		}
+	}
+	return Infinity
+}
+
 function hasXerialHeader(data: Buffer): boolean {
 	return data.length >= XERIAL_HEADER_SIZE && data.subarray(0, XERIAL_MAGIC.length).equals(XERIAL_MAGIC)
 }
 
-async function decompressSnappy(data: Buffer, decompressBlock: (block: Buffer) => Promise<Buffer>): Promise<Buffer> {
+type DecompressBlock = (block: Buffer) => Buffer | Promise<Buffer>
+
+function decompressSnappy(data: Buffer, decompressBlock: DecompressBlock): Buffer | Promise<Buffer> {
 	if (!hasXerialHeader(data)) {
 		return decompressBlock(data)
 	}
-	const chunks: Buffer[] = []
-	let offset = XERIAL_HEADER_SIZE
+	return decompressXerialChunks(data, decompressBlock, XERIAL_HEADER_SIZE, [])
+}
+
+/** Decompresses chunks in order, going async only from the first chunk the codec decompresses async. */
+function decompressXerialChunks(
+	data: Buffer,
+	decompressBlock: DecompressBlock,
+	offset: number,
+	chunks: Buffer[]
+): Buffer | Promise<Buffer> {
 	while (offset < data.length) {
 		if (offset + 4 > data.length) {
 			throw new Error('Invalid Xerial-framed Snappy data: truncated chunk length')
@@ -147,10 +192,19 @@ async function decompressSnappy(data: Buffer, decompressBlock: (block: Buffer) =
 				`Invalid Xerial-framed Snappy data: chunk size ${size} exceeds remaining ${data.length - offset} bytes`
 			)
 		}
-		chunks.push(await decompressBlock(data.subarray(offset, offset + size)))
+		const chunk = decompressBlock(data.subarray(offset, offset + size))
 		offset += size
+		if (chunk instanceof Promise) {
+			const next = offset
+			return chunk.then(decoded => {
+				chunks.push(decoded)
+				return decompressXerialChunks(data, decompressBlock, next, chunks)
+			})
+		}
+		chunks.push(chunk)
 	}
-	return Buffer.concat(chunks)
+	// A batch that fits one chunk is already contiguous; concatenating it would only copy it.
+	return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)
 }
 
 /**
@@ -193,21 +247,33 @@ export function createSnappyCodec(snappy: SnappyLib): CompressionCodec {
 		const asyncLib = snappy as SnappyNativeLib
 		// Compression stays a raw block: xerial's SnappyInputStream falls back to
 		// raw mode when the framing magic is absent, so Java consumers accept it.
+		if (!hasSnappySyncApi(snappy)) {
+			return {
+				compress: asyncLib.compress,
+				decompress: async data => decompressSnappy(data, block => asyncLib.uncompress(block)),
+			}
+		}
+		const decompressBlock = (block: Buffer) =>
+			snappyDecodedLength(block) <= SNAPPY_SYNC_MAX_DECODED_BYTES
+				? snappy.uncompressSync(block, SNAPPY_SYNC_OPTIONS)
+				: asyncLib.uncompress(block)
 		return {
-			compress: asyncLib.compress,
-			decompress: data => decompressSnappy(data, block => asyncLib.uncompress(block)),
+			compress: async data =>
+				data.length <= SNAPPY_SYNC_MAX_INPUT_BYTES
+					? snappy.compressSync(data, SNAPPY_SYNC_OPTIONS)
+					: asyncLib.compress(data),
+			decompress: async data => decompressSnappy(data, decompressBlock),
 		}
 	} else {
 		// Pure JS sync library (snappyjs)
 		const syncLib = snappy as SnappyJsLib
-		const decompressBlock = (block: Buffer) =>
-			Promise.resolve(Buffer.from(syncLib.uncompress(block) as ArrayBuffer))
+		const decompressBlock = (block: Buffer) => Buffer.from(syncLib.uncompress(block) as ArrayBuffer)
 		return {
 			compress(data: Buffer): Promise<Buffer> {
 				const result = syncLib.compress(data)
 				return Promise.resolve(Buffer.from(result as ArrayBuffer))
 			},
-			decompress: data => decompressSnappy(data, decompressBlock),
+			decompress: async data => decompressSnappy(data, decompressBlock),
 		}
 	}
 }

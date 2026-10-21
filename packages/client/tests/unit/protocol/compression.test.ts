@@ -186,6 +186,78 @@ describe('snappy Xerial framing', () => {
 	})
 })
 
+describe('snappy small-block fast path', () => {
+	type SyncSnappy = SnappyNativeLib & {
+		compressSync: (data: Buffer) => Buffer
+		uncompressSync: (data: Buffer) => Buffer
+	}
+	const snappy = createRequire(import.meta.url)('snappy') as SyncSnappy
+
+	function countingSnappy() {
+		const calls = { compress: 0, compressSync: 0, uncompress: 0, uncompressSync: 0 }
+		const lib: SyncSnappy = {
+			compress: data => (calls.compress++, snappy.compress(data)),
+			compressSync: data => (calls.compressSync++, snappy.compressSync(data)),
+			uncompress: data => (calls.uncompress++, snappy.uncompress(data)),
+			uncompressSync: data => (calls.uncompressSync++, snappy.uncompressSync(data)),
+		}
+		const codec = createSnappyCodec(lib)
+		calls.compress = 0 // the async-detection probe
+		return { codec, calls }
+	}
+
+	const json = (bytes: number) =>
+		Buffer.from('{"id":"8f1c","name":"Jane","city":"Detroit"},'.repeat(bytes / 45 + 1)).subarray(0, bytes)
+
+	function xerialFrame(...blocks: Buffer[]): Buffer {
+		const int32 = (n: number) => {
+			const b = Buffer.alloc(4)
+			b.writeInt32BE(n)
+			return b
+		}
+		const header = Buffer.concat([
+			Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]),
+			int32(1),
+			int32(1),
+		])
+		return Buffer.concat([header, ...blocks.flatMap(b => [int32(b.length), b])])
+	}
+
+	it('compresses and decompresses small blocks synchronously', async () => {
+		const { codec, calls } = countingSnappy()
+		const payload = json(4096)
+
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+		expect(calls).toEqual({ compress: 0, compressSync: 1, uncompress: 0, uncompressSync: 1 })
+	})
+
+	it('keeps large blocks on the async API', async () => {
+		const { codec, calls } = countingSnappy()
+		const payload = json(256 * 1024)
+
+		// Buffer.equals: toEqual walks large buffers element by element
+		expect((await codec.decompress(await codec.compress(payload))).equals(payload)).toBe(true)
+		expect(calls).toEqual({ compress: 1, compressSync: 0, uncompress: 1, uncompressSync: 0 })
+	})
+
+	it('decodes Xerial chunks in order when only some go async', async () => {
+		const { codec, calls } = countingSnappy()
+		const parts = [json(1000), json(128 * 1024), Buffer.from('tail')]
+		const framed = xerialFrame(...parts.map(p => snappy.compressSync(p)))
+
+		expect((await codec.decompress(framed)).equals(Buffer.concat(parts))).toBe(true)
+		expect(calls.uncompressSync).toBe(2)
+		expect(calls.uncompress).toBe(1)
+	})
+
+	it('hands a block with an unreadable length preamble to the async API', async () => {
+		const { codec, calls } = countingSnappy()
+
+		await expect(codec.decompress(Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]))).rejects.toThrow()
+		expect(calls.uncompress).toBe(1)
+	})
+})
+
 describe('automatic codec registration', () => {
 	/** A loader that serves fake modules by name and records the ids it was asked for */
 	function fakeLoader(modules: Record<string, unknown>): { loader: ModuleLoader; requested: string[] } {
