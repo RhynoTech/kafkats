@@ -185,8 +185,8 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 
 		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
-		// Give the microtask queue a chance to reach the await on the offset lookup.
-		await new Promise(resolve => setTimeout(resolve, 0))
+		// Decoding starts on a loop turn of its own, so a single timer tick may not reach the lookup.
+		await vi.waitFor(() => expect(lookupStarted).toBe(true), { timeout: 500 })
 
 		// Buffer was cleared before the lookup resolved (i.e. before the await).
 		expect(clearedDuringLookup).toBe(true)

@@ -54,7 +54,7 @@ describe('FetchManager.decodeRecords corruption handling', () => {
 		expect(records.map(r => r.value?.toString('utf-8'))).toEqual(['hello'])
 	})
 
-	it('throws on a complete-but-corrupt non-first batch instead of treating it as truncation', () => {
+	it('throws on a complete-but-corrupt non-first batch instead of treating it as truncation', async () => {
 		const fm = makeFetchManager()
 		const first = encodeRecordBatchSync(createRecordBatch([{ value: 'hello', timestamp: 0 }], 0n, 0n))
 		const second = encodeRecordBatchSync(createRecordBatch([{ value: 'world', timestamp: 0 }], 1n, 0n))
@@ -63,7 +63,8 @@ describe('FetchManager.decodeRecords corruption handling', () => {
 		second.writeUInt8(second.readUInt8(second.length - 1) ^ 0xff, second.length - 1)
 		const buf = Buffer.concat([first, second])
 
-		expect(() => fm.decodeRecords(buf, [], 100n)).toThrow(/corrupt data/)
+		// A slow first batch can use up the decode slice, which moves the rest onto the async path.
+		await expect(async () => fm.decodeRecords(buf, [], 100n)).rejects.toThrow(/corrupt data/)
 	})
 
 	it('throws on a complete-but-corrupt non-first batch on the async (compressed) path', async () => {
