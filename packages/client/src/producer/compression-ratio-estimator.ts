@@ -1,19 +1,18 @@
 /**
  * Compression ratio estimation for sizing record batches before they are encoded.
  *
- * A port of the Java client's CompressionRatioEstimator and of how MemoryRecordsBuilder uses it
- * (Kafka 3.9): one ratio per topic and codec, starting at 1.0, that moves towards observed ratios
- * slowly when batches compress better and quickly when they compress worse, so estimates stay
- * on the safe side.
+ * Modelled on the Java client's CompressionRatioEstimator and how MemoryRecordsBuilder uses it
+ * (Kafka 3.9): one ratio per topic and codec, starting at 1.0, with a 5% margin. Java lets the
+ * ratio improve by only 0.005 per batch; here it follows each observed batch at once. The producer
+ * checks a batch's exact size before sending it, so a ratio that turns out low costs one more
+ * encode, while one that stays high costs a request for every extra piece, and the pieces of a
+ * partition are sent one after another.
  */
 
 import { CompressionType } from '@/protocol/records/compression.js'
 
 export const RECORD_BATCH_HEADER_BYTES = 61
 
-// Java's COMPRESSION_RATIO_IMPROVING_STEP and COMPRESSION_RATIO_DETERIORATE_STEP.
-const IMPROVING_STEP = 0.005
-const DETERIORATE_STEP = 0.05
 // Java's COMPRESSION_RATE_ESTIMATION_FACTOR, applied on top of the estimated ratio.
 const ESTIMATION_FACTOR = 1.05
 const INITIAL_RATIO = 1
@@ -32,18 +31,11 @@ export class CompressionRatioEstimator {
 		return this.ratios.get(key(topic, compression)) ?? INITIAL_RATIO
 	}
 
-	/** Move the estimate towards the ratio of a batch that was just encoded; returns the new estimate. */
+	/** Estimate from now on the ratio of a batch that was just encoded; returns it. */
 	observe(topic: string, compression: CompressionType, recordBytes: number, encodedBatchBytes: number): number {
-		const current = this.ratio(topic, compression)
 		const observed = Math.max(encodedBatchBytes - RECORD_BATCH_HEADER_BYTES, 0) / Math.max(recordBytes, 1)
-		let next = current
-		if (observed > current) {
-			next = Math.max(current + DETERIORATE_STEP, observed)
-		} else if (observed < current) {
-			next = Math.max(current - IMPROVING_STEP, observed)
-		}
-		this.ratios.set(key(topic, compression), next)
-		return next
+		this.ratios.set(key(topic, compression), observed)
+		return observed
 	}
 
 	/** Java's reset after a batch the broker rejected as too large: back to 1.0, or worse if observed worse. */

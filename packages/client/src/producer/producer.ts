@@ -67,6 +67,11 @@ const TOPIC_LIMIT_TTL_MS = 5 * 60 * 1000
 
 type TopicBatchLimit = { fits: number; rejected: number; rejectedAt: number }
 
+// The compression ratio estimate only decides how batches near the limit are cut, and much smaller
+// batches compress worse (single records worst): learning from them would cut large sends into
+// more pieces than they need.
+const MIN_OBSERVED_BATCH_FRACTION = 1 / 16
+
 /** Upper bound on a record's size inside an encoded batch: its two deltas count at their widest varints. */
 function recordSizeUpperBound(message: QueuedMessage): number {
 	// attributes, timestampDelta (varlong), offsetDelta (varint), key, value, header count
@@ -507,7 +512,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					// them, or pieces of them, under the next epoch would write records reported failed.
 					continue
 				}
-				this.compressionRatios.observe(topic, compression, recordBytes, encodedBatch.length)
+				if (recordBytes >= limit * MIN_OBSERVED_BATCH_FRACTION) {
+					this.compressionRatios.observe(topic, compression, recordBytes, encodedBatch.length)
+				}
 
 				const encodeEnd = performance.now()
 				if (this.trace) {
@@ -537,9 +544,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 						messagesToSend[0]!.reject(error)
 						continue
 					}
-					// Cut by the ratio these records just showed, not the estimate, which may lag far behind
-					// (it restarts at 1.0 after a broker rejection). That budget is below their total, so
-					// the cut always leaves at least two pieces.
+					// Cut by the ratio these records just showed. That budget is below their total, so the cut
+					// always leaves at least two pieces.
 					const observedRatio = (encodedBatch.length - RECORD_BATCH_HEADER_BYTES) / recordBytes
 					const budget = recordBytesWithin(limit, compression, observedRatio)
 					const kept = this.keepFirstPiece(batch, messagesToSend, sizes, budget, 'encoded_size')

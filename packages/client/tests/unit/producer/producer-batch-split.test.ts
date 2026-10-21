@@ -97,6 +97,16 @@ function compressible(totalBytes: number, partition = 0) {
 	}))
 }
 
+const SHARED_RUN = randomBytes(2000)
+
+/** Records of 3000 bytes ending in the same 2000 random bytes: alone one barely compresses, many do. */
+function sharingARun(totalBytes: number, partition = 0) {
+	return Array.from({ length: Math.ceil(totalBytes / 3000) }, () => ({
+		value: Buffer.concat([randomBytes(1000), SHARED_RUN]),
+		partition,
+	}))
+}
+
 function incompressible(totalBytes: number, partition = 0) {
 	return Array.from({ length: Math.ceil(totalBytes / 3000) }, () => ({ value: randomBytes(3000), partition }))
 }
@@ -279,6 +289,31 @@ describe('Producer record batch splitting', () => {
 			expect(sent.reduce((s, b) => s + b.bytes, 0)).toBeLessThan(LIMIT)
 		})
 
+		it('learns the ratio from the first batch large enough to need cutting', async () => {
+			const sent = fakeLeader(mockBroker)
+			const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true, compression: 'snappy' })
+			await producer.send(TOPIC, compressible(1_500_000))
+			sent.length = 0
+
+			await producer.send(TOPIC, compressible(1_500_000))
+
+			expect(sent).toHaveLength(1)
+		})
+
+		it('does not learn from small batches, which compress worse than the large ones it sizes', async () => {
+			const sent = fakeLeader(mockBroker)
+			const producer = new Producer(mockCluster, { lingerMs: 0, idempotent: true, compression: 'snappy' })
+			await producer.send(TOPIC, sharingARun(200_000))
+			for (let i = 0; i < 20; i++) {
+				await producer.send(TOPIC, sharingARun(3000)[0]!)
+			}
+			sent.length = 0
+
+			await producer.send(TOPIC, sharingARun(1_500_000))
+
+			expect(sent).toHaveLength(1)
+		})
+
 		it('sends what fits by the learned ratio as one batch, and cuts larger sends with one encode per piece', async () => {
 			const sent = fakeLeader(mockBroker)
 			const encodes: ProducerTraceEvent[] = []
@@ -288,10 +323,7 @@ describe('Producer record batch splitting', () => {
 				compression: 'snappy',
 				trace: traced('encode_batch', encodes),
 			})
-			// The estimate improves by 0.005 per batch from 1.0, so ~130 batches teach it a ~0.4 ratio.
-			for (let i = 0; i < 140; i++) {
-				await producer.send(TOPIC, compressible(30_000))
-			}
+			await producer.send(TOPIC, compressible(200_000))
 			sent.length = 0
 			encodes.length = 0
 
@@ -317,9 +349,7 @@ describe('Producer record batch splitting', () => {
 				trace: e =>
 					void (e.stage === 'encode_batch' ? encodes.push(e) : e.stage === 'batch_split' && splits.push(e)),
 			})
-			for (let i = 0; i < 140; i++) {
-				await producer.send(TOPIC, compressible(30_000))
-			}
+			await producer.send(TOPIC, compressible(200_000))
 			sent.length = 0
 			encodes.length = 0
 
