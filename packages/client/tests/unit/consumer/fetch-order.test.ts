@@ -1,11 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 import type { IsolationLevel, TopicPartition } from '@/consumer/types.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { FetchRequest } from '@/protocol/messages/requests/fetch.js'
-import { CompressionType } from '@/protocol/records/compression.js'
+import { CompressionType, gzipCodec } from '@/protocol/records/compression.js'
 import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/protocol/records/index.js'
 
 function makeFetchManager(isolationLevel: IsolationLevel = 'read_uncommitted') {
@@ -75,6 +75,10 @@ function requestOrder(request: FetchRequest): Array<[string, number[]]> {
 }
 
 describe('FetchManager fetch order', () => {
+	afterEach(() => {
+		vi.restoreAllMocks()
+	})
+
 	it('moves a partition that returned records behind the others and keeps that order on the wire', async () => {
 		const { broker, fm, fmAny } = makeFetchManager()
 		fm.addPartitions([
@@ -103,7 +107,10 @@ describe('FetchManager fetch order', () => {
 		])
 	})
 
-	it('moves a partition behind the others after decoding compressed records', async () => {
+	// Records are decoded only shortly before a poll delivers them, so the batches a fetch returned, not the
+	// records decoded from them, decide the rotation.
+	it('moves a partition behind the others once its fetch returned compressed batches, before decoding any', async () => {
+		const decompress = vi.spyOn(gzipCodec, 'decompress')
 		const { broker, fm, fmAny } = makeFetchManager()
 		fm.addPartitions([
 			{ topic: 'a', partition: 0, offset: 0n },
@@ -116,7 +123,27 @@ describe('FetchManager fetch order', () => {
 		broker.fetch.mockResolvedValueOnce(fetchResponse([{ topic: 'a', partition: 0, recordsData }]))
 		await fmAny.fetchFromBrokerToBuffer(broker, [...fmAny.partitionStates.values()], 1048576)
 
+		expect(decompress).not.toHaveBeenCalled()
 		expect(fmAny.fetchBuffer.add).toHaveBeenCalledOnce()
+		expect([...fmAny.partitionStates.keys()]).toEqual(['b:0', 'a:0'])
+	})
+
+	it('moves a partition behind the others when a corrupt batch follows the batches it returned', async () => {
+		const { broker, fm, fmAny } = makeFetchManager()
+		fm.addPartitions([
+			{ topic: 'a', partition: 0, offset: 0n },
+			{ topic: 'b', partition: 0, offset: 0n },
+		])
+		const corrupt = encodeRecordBatchSync(createRecordBatch([{ value: 'w' }], 1n, 0n))
+		corrupt[corrupt.length - 1]! ^= 0xff
+
+		broker.fetch.mockResolvedValueOnce(
+			fetchResponse([{ topic: 'a', partition: 0, recordsData: Buffer.concat([oneRecord, corrupt]) }])
+		)
+		await fmAny.fetchFromBrokerToBuffer(broker, [...fmAny.partitionStates.values()], 1048576)
+
+		expect(fmAny.fetchBuffer.add.mock.calls[0]![0].corruption.offset).toBe(1n)
+		expect(fmAny.partitionStates.get('a:0').offset).toBe(1n)
 		expect([...fmAny.partitionStates.keys()]).toEqual(['b:0', 'a:0'])
 	})
 
