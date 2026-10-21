@@ -200,6 +200,26 @@ describe('FetchManager fetch sessions', () => {
 		expect(broker.closeFetchSession).toHaveBeenCalledTimes(1)
 	})
 
+	it('does not hold up stop for a broker that does not answer the close', async () => {
+		const { broker, fm, fetchOnce } = setup()
+		broker.fetch.mockResolvedValueOnce(fetchResponse(7, [{ partition: 0 }, { partition: 1 }]))
+		await fetchOnce()
+		broker.closeFetchSession.mockReturnValueOnce(new Promise(() => {}))
+
+		vi.useFakeTimers()
+		try {
+			let stopped = false
+			void fm.stop().then(() => {
+				stopped = true
+			})
+			await vi.advanceTimersByTimeAsync(1000)
+			expect(stopped).toBe(true)
+		} finally {
+			vi.useRealTimers()
+		}
+		expect(broker.closeFetchSession).toHaveBeenCalledWith(7)
+	})
+
 	it('does not close anything when the broker never created a session', async () => {
 		const { broker, fm, fetchOnce, lastRequest } = setup()
 		broker.fetch.mockResolvedValue(fetchResponse(0, [{ partition: 0 }, { partition: 1 }]))

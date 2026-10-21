@@ -33,6 +33,8 @@ const NULL_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
 // Java's reconnect.backoff.ms and reconnect.backoff.max.ms.
 const LEADER_RETRY_BACKOFF_MS = 50
 const LEADER_RETRY_BACKOFF_MAX_MS = 1000
+// The broker answers a close at once; one that hangs must not hold up shutdown for the request timeout.
+const FETCH_SESSION_CLOSE_TIMEOUT_MS = 1000
 
 /**
  * True when the bytes at the decoder's position cannot hold the batch they declare: either the
@@ -869,8 +871,8 @@ export class FetchManager {
 	}
 
 	/**
-	 * Stop the fetch loop. The returned promise settles once the brokers were asked to close their
-	 * fetch sessions; it never rejects.
+	 * Stop the fetch loop. The returned promise settles once the brokers answered the request to close
+	 * their fetch sessions, or after a second; it never rejects.
 	 */
 	stop(): Promise<void> {
 		this.logger.debug('stopping fetch manager')
@@ -907,7 +909,12 @@ export class FetchManager {
 			)
 		}
 		this.fetchSessions.clear()
-		await Promise.all(closing)
+		const timeout = new AbortController()
+		await Promise.race([
+			Promise.all(closing),
+			sleep(FETCH_SESSION_CLOSE_TIMEOUT_MS, { signal: timeout.signal, resolveOnAbort: true }),
+		])
+		timeout.abort()
 	}
 
 	private fetchSession(broker: Broker): FetchSessionHandler {
