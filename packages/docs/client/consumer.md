@@ -66,7 +66,8 @@ value sizes). The broker sizes fetches in stored bytes, so one fetch of compress
 Records fetched ahead while a handler is busy stay buffered for the next batch, so a slow handler never receives more
 than one partition's byte budget at once. A record larger than the limit is delivered on its own. A partition whose
 fetch returned data, even only aborted or control records, moves behind the others in the next request, so backlogged
-partitions take turns instead of the first one taking every response.
+partitions take turns instead of the first one taking every response. Low-volume partitions get handler slots too, so
+a backlog next to many of them drains more slowly than it would alone; raise `partitionConcurrency` if it must keep up.
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 
